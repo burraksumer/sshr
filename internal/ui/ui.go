@@ -47,7 +47,6 @@ type Model struct {
 	visible        []*content.Entry
 
 	// reader
-	renders   map[renderKey]render.Document
 	resizeGen int
 	entry     *content.Entry
 	doc       render.Document
@@ -71,17 +70,6 @@ func New(store *content.Store) Model {
 	m.syncSite()
 	return m
 }
-
-// renderKey identifies a rendered entry. Resizing back and forth or
-// revisiting an entry reuses the render.
-type renderKey struct {
-	entry *content.Entry
-	width int
-	dark  bool
-}
-
-// maxRenders caps the per-session render cache.
-const maxRenders = 8
 
 // resizeSettle is how long the window size must stay the same before the
 // entry is rendered again.
@@ -388,20 +376,11 @@ func (m *Model) renderEntry(top bool) {
 	m.vp.SetWidth(m.width)
 	m.vp.SetHeight(max(m.height-1, 1))
 
-	key := renderKey{m.entry, w, m.dark}
-	doc, ok := m.renders[key]
-	if !ok {
-		var err error
-		doc, err = render.Markdown(m.entry.Body, render.Options{Width: w, Dark: m.dark, BaseURL: m.entry.URL})
-		if err != nil {
-			// The body is sanitized markdown, but render failed, so show it
-			// unstyled rather than nothing.
-			doc = render.Document{Content: m.entry.Body}
-		}
-		if m.renders == nil || len(m.renders) >= maxRenders {
-			m.renders = map[renderKey]render.Document{}
-		}
-		m.renders[key] = doc
+	doc, err := render.Cached(m.entry.Body, render.Options{Width: w, Dark: m.dark, BaseURL: m.entry.URL})
+	if err != nil {
+		// The body is sanitized markdown, but render failed, so show it
+		// unstyled rather than nothing.
+		doc = render.Document{Content: m.entry.Body}
 	}
 	m.doc = doc
 

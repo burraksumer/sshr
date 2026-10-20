@@ -131,7 +131,7 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 		site.Description = meta.description
 		for _, f := range meta.feeds {
 			if u, err := res.URL.Parse(f.href); err == nil {
-				feedLinks = append(feedLinks, feedLink{href: u.String(), typ: f.typ})
+				feedLinks = append(feedLinks, feedLink{href: sanitize.URL(u.String()), typ: f.typ})
 			}
 		}
 	}
@@ -149,6 +149,22 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 	}
 	feedEntries := slices.Clone(entries)
 
+	// Posts that came with full content can be shown before sitemaps and
+	// pages are fetched, which can take minutes on a slow site.
+	if prev == nil && publish != nil {
+		var ready []*Entry
+		for _, e := range entries {
+			if strings.TrimSpace(e.Body) != "" {
+				c := *e
+				ready = append(ready, &c)
+			}
+		}
+		if len(ready) > 0 {
+			partial := *site
+			publish(finish(&partial, ready))
+		}
+	}
+
 	// The sitemap adds pages the feed doesn't list.
 	seen := map[string]bool{normalize(d.Base): true}
 	if feedURL != "" {
@@ -162,33 +178,19 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 		}
 	}
 	if room := maxEntries - len(entries); room > 0 {
-		pages, cache := d.loadSitemaps(ctx, sitemaps, prev, log)
+		pages, cache := d.loadSitemaps(ctx, sitemaps, prev, scope, log)
 		site.sitemaps = cache
 		for _, p := range pages {
 			if room == 0 {
 				break
 			}
 			key := normalize(p.loc)
-			if seen[key] || !inScope(p.loc, scope) || !d.Client.Allowed(ctx, p.loc) || !readablePath(p.loc.Path) {
+			if seen[key] || !d.Client.Allowed(ctx, p.loc) {
 				continue
 			}
 			seen[key] = true
 			entries = append(entries, &Entry{URL: sanitize.URL(p.loc.String()), Kind: Page, Date: p.lastmod})
 			room--
-		}
-	}
-
-	if prev == nil && publish != nil {
-		var ready []*Entry
-		for _, e := range entries {
-			if strings.TrimSpace(e.Body) != "" {
-				c := *e
-				ready = append(ready, &c)
-			}
-		}
-		if len(ready) > 0 {
-			partial := *site
-			publish(finish(&partial, ready))
 		}
 	}
 
@@ -280,22 +282,34 @@ func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []feedLink,
 			continue
 		}
 		feed, err := parser.Parse(bytes.NewReader(res.Body))
-		if err != nil || len(feed.Items) == 0 {
+		if err != nil {
+			// An HTML maintenance page in place of the feed, say.
+			if prev != nil && raw == prev.feedURL {
+				prevFailed = true
+			}
 			continue
 		}
-		site.feedTitle, site.feedDescription = sanitize.Line(feed.Title), sanitize.Line(feed.Description)
-		if site.feedTitle != "" {
-			site.Title = site.feedTitle
+		if len(feed.Items) == 0 {
+			continue
 		}
-		if site.feedDescription != "" {
-			site.Description = site.feedDescription
-		}
+		scope := d.scope()
 		entries := make([]*Entry, 0, len(feed.Items))
 		for _, item := range feed.Items {
-			if e := entryFromItem(item, res.URL); e != nil {
-				entries = append(entries, e)
+			e := entryFromItem(item, res.URL)
+			if e == nil {
+				continue
 			}
+			// A site-wide feed found from a /blog site only counts for
+			// its /blog posts.
+			if u, err := url.Parse(e.URL); e.URL != "" && (err != nil || !inScope(u, scope)) {
+				continue
+			}
+			entries = append(entries, e)
 		}
+		if len(entries) == 0 {
+			continue
+		}
+		applyFeedMeta(site, sanitize.Line(feed.Title), sanitize.Line(feed.Description))
 		log.Info("feed", "url", raw, "items", len(entries))
 		return entries, raw
 	}
@@ -321,14 +335,20 @@ func reuseFeed(site, prev *Site) []*Entry {
 		}
 		kept = append(kept, &c)
 	}
-	site.feedTitle, site.feedDescription = prev.feedTitle, prev.feedDescription
-	if site.feedTitle != "" {
-		site.Title = site.feedTitle
-	}
-	if site.feedDescription != "" {
-		site.Description = site.feedDescription
-	}
+	applyFeedMeta(site, prev.feedTitle, prev.feedDescription)
 	return kept
+}
+
+// applyFeedMeta records the feed's title and description. They win over the
+// homepage's when set.
+func applyFeedMeta(site *Site, title, description string) {
+	site.feedTitle, site.feedDescription = title, description
+	if title != "" {
+		site.Title = title
+	}
+	if description != "" {
+		site.Description = description
+	}
 }
 
 // transient reports whether an HTTP status is worth keeping old data over.
@@ -512,7 +532,7 @@ type sitemapDoc struct {
 
 // loadSitemaps reads the given sitemaps, following sitemap indexes, and
 // returns page URLs newest first.
-func (d *Discoverer) loadSitemaps(ctx context.Context, roots []string, prev *Site, log *slog.Logger) ([]sitemapURL, map[string]cachedSitemap) {
+func (d *Discoverer) loadSitemaps(ctx context.Context, roots []string, prev *Site, scope string, log *slog.Logger) ([]sitemapURL, map[string]cachedSitemap) {
 	const maxFiles, maxURLs = 10, 2000
 	// robots.txt Sitemap lines can be relative or broken, like an unrendered
 	// template. Keep the ones that resolve to an allowed URL.
@@ -558,34 +578,48 @@ func (d *Discoverer) loadSitemaps(ctx context.Context, roots []string, prev *Sit
 		case res.Status != 200:
 			continue
 		default:
-			c.base = res.URL
-			if err := xml.Unmarshal(res.Body, &c.doc); err != nil {
+			var doc sitemapDoc
+			if err := xml.Unmarshal(res.Body, &doc); err != nil {
 				continue
 			}
+			c = parseSitemap(doc, res.URL, scope)
 		}
 		cache[raw] = c
-		doc := c.doc
-		for _, s := range doc.Sitemaps {
-			if child, err := c.base.Parse(strings.TrimSpace(s.Loc)); err == nil && d.Client.Allowed(ctx, child) {
-				queue = append(queue, child.String())
+		for _, child := range c.children {
+			if u, err := url.Parse(child); err == nil && d.Client.Allowed(ctx, u) {
+				queue = append(queue, child)
 			}
 		}
-		for _, x := range doc.URLs {
-			loc, err := c.base.Parse(strings.TrimSpace(x.Loc))
-			if err != nil {
-				continue
-			}
-			out = append(out, sitemapURL{loc: loc, lastmod: parseDate(x.LastMod)})
-		}
+		out = append(out, c.pages...)
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].lastmod.After(out[j].lastmod) })
 	return out, cache
 }
 
-// cachedSitemap is a parsed sitemap kept for conditional requests.
+// cachedSitemap is what sshr keeps from a sitemap for conditional requests:
+// its child sitemaps and the in-scope pages, not the whole document.
 type cachedSitemap struct {
-	base *url.URL
-	doc  sitemapDoc
+	children []string
+	pages    []sitemapURL
+}
+
+// parseSitemap resolves a sitemap's URLs against base and keeps child
+// sitemaps and the pages inside scope that look like pages, not files.
+func parseSitemap(doc sitemapDoc, base *url.URL, scope string) cachedSitemap {
+	var c cachedSitemap
+	for _, s := range doc.Sitemaps {
+		if child, err := base.Parse(strings.TrimSpace(s.Loc)); err == nil {
+			c.children = append(c.children, sanitize.URL(child.String()))
+		}
+	}
+	for _, x := range doc.URLs {
+		loc, err := base.Parse(strings.TrimSpace(x.Loc))
+		if err != nil || !inScope(loc, scope) || !readablePath(loc.Path) {
+			continue
+		}
+		c.pages = append(c.pages, sitemapURL{loc: loc, lastmod: parseDate(x.LastMod)})
+	}
+	return c
 }
 
 type headMeta struct {

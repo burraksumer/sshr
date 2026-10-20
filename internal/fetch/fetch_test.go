@@ -165,3 +165,17 @@ func TestRobots5xxDisallowsAll(t *testing.T) {
 		t.Errorf("err = %v, want ErrDisallowed", err)
 	}
 }
+
+// robots.txt that redirects to a host sshr won't contact counts as missing.
+func TestRobotsRedirectOffAllowlist(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "https://cdn.elsewhere.example/robots.txt", http.StatusMovedPermanently)
+	})
+	mux.HandleFunc("/page", func(w http.ResponseWriter, r *http.Request) {})
+	srv, c := testServer(t, mux.ServeHTTP)
+	c.LoadRobots(context.Background(), mustURL(t, srv.URL))
+	if _, err := c.Get(context.Background(), mustURL(t, srv.URL+"/page"), "", false); err != nil {
+		t.Errorf("err = %v, want the page to be allowed", err)
+	}
+}

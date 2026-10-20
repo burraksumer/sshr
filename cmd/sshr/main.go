@@ -16,6 +16,7 @@ import (
 	"github.com/burraksumer/sshr/internal/config"
 	"github.com/burraksumer/sshr/internal/content"
 	"github.com/burraksumer/sshr/internal/fetch"
+	"github.com/burraksumer/sshr/internal/sanitize"
 	"github.com/burraksumer/sshr/internal/server"
 	"github.com/burraksumer/sshr/internal/ui"
 )
@@ -171,7 +172,17 @@ func newStore(cfg config.Config, log *slog.Logger) (*content.Store, error) {
 }
 
 func newLogger(format string) *slog.Logger {
-	opts := &slog.HandlerOptions{}
+	// Log values can carry text from the fetched site, like URLs. The JSON
+	// handler escapes C0 controls but not C1 controls or bidi overrides.
+	opts := &slog.HandlerOptions{ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
+		switch v := a.Value.Any().(type) {
+		case string:
+			return slog.String(a.Key, sanitize.Text(v))
+		case error:
+			return slog.String(a.Key, sanitize.Text(v.Error()))
+		}
+		return a
+	}}
 	if os.Getenv("SSHR_DEBUG") != "" {
 		opts.Level = slog.LevelDebug
 	}

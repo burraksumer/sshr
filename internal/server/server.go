@@ -64,7 +64,10 @@ func New(cfg Config, store *content.Store, log *slog.Logger) (*Server, error) {
 		}
 	}
 
-	conns := newLimiter(cfg.MaxPerIP, cfg.MaxSessions)
+	// Connections get twice the session caps, so a visitor over the session
+	// limit reaches limitSessions and sees a message instead of a bare
+	// disconnect. Connections without a session close after 30 seconds.
+	conns := newLimiter(2*cfg.MaxPerIP, 2*cfg.MaxSessions)
 	sessions := newLimiter(cfg.MaxPerIP, cfg.MaxSessions)
 
 	srv, err := wish.NewServer(

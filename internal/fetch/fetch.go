@@ -140,7 +140,7 @@ func New(opts Options) *Client {
 				return err
 			}
 			if req.Context().Value(skipRobots{}) == nil && !c.robotsAllow(req.Context(), req.URL) {
-				return fmt.Errorf("%w: redirect to %s", ErrDisallowed, req.URL)
+				return fmt.Errorf("%w: redirect to %q", ErrDisallowed, req.URL)
 			}
 			return nil
 		},
@@ -221,7 +221,12 @@ func (c *Client) fetchRobots(ctx context.Context, u *url.URL) (*robotstxt.Robots
 	ru := u.ResolveReference(&url.URL{Path: "/robots.txt"})
 	data := disallowAll
 	resp, err := c.get(context.WithValue(ctx, skipRobots{}, true), ru, "text/plain", false, false, c.maxBytes)
-	if err == nil {
+	if errors.Is(err, ErrNotAllowed) {
+		// robots.txt redirects to a host sshr won't contact, like a CDN.
+		// RFC 9309 treats a robots.txt that can't be followed as missing,
+		// which allows everything. Only network errors and 5xx disallow.
+		data, _ = robotstxt.FromStatusAndBytes(http.StatusNotFound, nil)
+	} else if err == nil {
 		var perr error
 		data, perr = robotstxt.FromStatusAndBytes(resp.Status, resp.Body)
 		if perr != nil {

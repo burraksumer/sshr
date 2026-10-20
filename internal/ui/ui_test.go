@@ -40,7 +40,7 @@ func TestResizeRendersOnceSettled(t *testing.T) {
 	for i, cmd := range cmds {
 		msg := cmd()
 		next, _ := tm.(Model).Update(msg)
-		rendered := next.(Model).renders != nil
+		rendered := next.(Model).doc.Content != ""
 		if want := i == len(cmds)-1; rendered != want {
 			t.Errorf("resize %d rendered = %v, want %v", i, rendered, want)
 		}

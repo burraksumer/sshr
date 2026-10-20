@@ -200,3 +200,24 @@ func TestAllowedOSCRejectsNonASCII(t *testing.T) {
 		t.Error("OSC with a C1 control was allowed")
 	}
 }
+
+func TestDocCacheEvicts(t *testing.T) {
+	c := newDocCache(90)
+	doc := func(n int) Document { return Document{Content: strings.Repeat("x", n)} }
+	c.put(cacheKey{md: "a"}, doc(20))
+	c.put(cacheKey{md: "b"}, doc(20))
+	c.get(cacheKey{md: "a"}) // a is now most recent
+	c.put(cacheKey{md: "c"}, doc(20))
+	c.put(cacheKey{md: "d"}, doc(20))
+	c.put(cacheKey{md: "e"}, doc(20)) // over 90 bytes, b goes first
+	if _, ok := c.get(cacheKey{md: "b"}); ok {
+		t.Error("least recently used entry kept")
+	}
+	if _, ok := c.get(cacheKey{md: "a"}); !ok {
+		t.Error("recently used entry evicted")
+	}
+	c.put(cacheKey{md: "huge"}, doc(30))
+	if _, ok := c.get(cacheKey{md: "huge"}); ok {
+		t.Error("entry over a quarter of the cache was stored")
+	}
+}

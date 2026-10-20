@@ -199,7 +199,7 @@ func checkHost(h string) error {
 	if host == "" || strings.ContainsAny(host, "/:@?#% ") && net.ParseIP(host) == nil {
 		return fmt.Errorf("%q should be a host like cdn.example.com or cdn.example.com:8443, without a scheme or path", h)
 	}
-	if port != "" {
+	if err == nil {
 		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
 			return fmt.Errorf("%q has an invalid port", h)
 		}

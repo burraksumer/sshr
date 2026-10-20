@@ -538,3 +538,99 @@ func TestEntryURLsEncoded(t *testing.T) {
 		t.Errorf("entry URL kept C1 controls: %q", e.URL)
 	}
 }
+
+// An HTML page served in place of the feed keeps the previous posts.
+func TestFeedReplacedByHTMLPage(t *testing.T) {
+	var broken atomic.Bool
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("/feed.xml", func(w http.ResponseWriter, r *http.Request) {
+		if broken.Load() {
+			w.Header().Set("Content-Type", "text/html")
+			w.Write([]byte("<html><body>Down for maintenance</body></html>"))
+			return
+		}
+		w.Write([]byte(`<?xml version="1.0"?><rss version="2.0"><channel><title>T</title><item><title>P</title>
+<link>` + srv.URL + `/p</link><content:encoded xmlns:content="http://purl.org/rss/1.0/modules/content/">Body</content:encoded></item></channel></rss>`))
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+	base, _ := url.Parse(srv.URL + "/")
+	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Host}, Rate: 1000, Burst: 100}), Base: base}
+	first, err := d.Discover(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	broken.Store(true)
+	second, err := d.Discover(context.Background(), first, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Lookup(srv.URL+"/p") == nil || second.feedURL == "" {
+		t.Errorf("posts or feed URL lost: feedURL %q", second.feedURL)
+	}
+}
+
+// A site-wide feed found from a /blog site only contributes /blog posts, and
+// out-of-scope sitemap URLs don't use up the sitemap URL cap.
+func TestScopeAppliesToFeedAndSitemapCap(t *testing.T) {
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("/feed.xml", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`<?xml version="1.0"?><rss version="2.0"><channel><title>T</title>
+<item><title>Blog</title><link>` + srv.URL + `/blog/a</link><content:encoded xmlns:content="http://purl.org/rss/1.0/modules/content/">x</content:encoded></item>
+<item><title>Shop</title><link>` + srv.URL + `/shop/b</link><content:encoded xmlns:content="http://purl.org/rss/1.0/modules/content/">x</content:encoded></item>
+</channel></rss>`))
+	})
+	mux.HandleFunc("/sitemap.xml", func(w http.ResponseWriter, r *http.Request) {
+		var b strings.Builder
+		b.WriteString(`<?xml version="1.0"?><urlset>`)
+		for i := range 2500 {
+			fmt.Fprintf(&b, "<url><loc>/products/%d</loc></url>", i)
+		}
+		b.WriteString(`<url><loc>/blog/about</loc></url></urlset>`)
+		w.Write([]byte(b.String()))
+	})
+	mux.HandleFunc("/blog/about", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/markdown")
+		w.Write([]byte("About\n"))
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+	base, _ := url.Parse(srv.URL + "/blog")
+	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Host}, Rate: 1000, Burst: 100}), Base: base}
+	site, err := d.Discover(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if site.Lookup(srv.URL+"/shop/b") != nil {
+		t.Error("out-of-scope feed item included")
+	}
+	if site.Lookup(srv.URL+"/blog/a") == nil || site.Lookup(srv.URL+"/blog/about") == nil {
+		t.Errorf("in-scope entries missing: %d entries", len(site.Entries))
+	}
+}
+
+// The partial snapshot is published before sitemaps are fetched.
+func TestPartialBeforeSitemaps(t *testing.T) {
+	var published atomic.Bool
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("/feed.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/feed+json")
+		w.Write([]byte(`{"version":"https://jsonfeed.org/version/1.1","items":[{"id":"1","url":"` + srv.URL + `/p","title":"P","content_text":"body"}]}`))
+	})
+	mux.HandleFunc("/sitemap.xml", func(w http.ResponseWriter, r *http.Request) {
+		if !published.Load() {
+			t.Error("sitemap fetched before the partial snapshot was published")
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+	base, _ := url.Parse(srv.URL + "/")
+	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Host}, Rate: 1000, Burst: 100}), Base: base}
+	if _, err := d.Discover(context.Background(), nil, func(*Site) { published.Store(true) }); err != nil {
+		t.Fatal(err)
+	}
+}

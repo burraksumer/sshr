@@ -86,7 +86,7 @@ func TestValidateAllowedHosts(t *testing.T) {
 			t.Errorf("%q: %v", ok, err)
 		}
 	}
-	for _, bad := range []string{"https://cdn.example.com", "cdn.example.com/feeds", "cdn.example.com:0", "cdn.example.com:http", ""} {
+	for _, bad := range []string{"https://cdn.example.com", "cdn.example.com/feeds", "cdn.example.com:0", "cdn.example.com:http", "cdn.example.com:", ""} {
 		c.AllowedHosts = []string{bad}
 		if c.Validate() == nil {
 			t.Errorf("%q: no error", bad)
