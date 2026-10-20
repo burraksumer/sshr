@@ -56,7 +56,7 @@ type Model struct {
 	doc       render.Document
 	vp        viewport.Model
 	digits    string
-	history   []*content.Entry
+	history   []visit
 	status    string
 }
 
@@ -80,6 +80,31 @@ func New(store *content.Store) Model {
 const resizeSettle = 120 * time.Millisecond
 
 type resizedMsg struct{ gen int }
+
+// visit is an entry in the back history and where the reader was in it.
+type visit struct {
+	entry *content.Entry
+	pos   float64
+}
+
+// renderKey names the render the view is waiting for.
+type renderKey struct {
+	id    any
+	width int
+	dark  bool
+}
+
+// renderedMsg brings back a render done off the event loop.
+type renderedMsg struct {
+	key renderKey
+	doc render.Document
+	pos float64
+}
+
+// syncRender is the body size under which rendering is quick enough to do
+// inside Update. Larger bodies render in the background so keys keep
+// working.
+const syncRender = 64 << 10
 
 type pollMsg struct{}
 
@@ -176,7 +201,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			gen := m.resizeGen
 			return m, tea.Tick(resizeSettle, func(time.Time) tea.Msg { return resizedMsg{gen} })
 		}
-		m.renderEntry(false)
+		pos := m.keepPos
+		m.resizing = false
+		return m, m.renderEntry(pos)
+
+	case renderedMsg:
+		if m.entry != nil && msg.key == m.currentKey() {
+			m.show(msg.doc, msg.pos)
+		}
 		return m, nil
 
 	case tea.BackgroundColorMsg:
@@ -184,7 +216,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.dark = dark
 			m.st = newStyles(dark)
 			if m.entry != nil {
-				m.renderEntry(false)
+				return m, m.renderEntry(readingPosition(m.vp))
 			}
 		}
 		return m, nil
@@ -236,7 +268,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.screen == screenList && msg.Button == tea.MouseLeft {
 			if i := m.rowAt(msg.Y); i >= 0 {
 				m.cursor = i
-				m.open(m.visible[i], false)
+				return m, m.open(m.visible[i], false)
 			}
 		}
 		return m, nil
@@ -301,7 +333,7 @@ func (m Model) updateList(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.move(-max(m.listHeight()/2, 1))
 	case "enter", "l", "right":
 		if m.cursor < len(m.visible) {
-			m.open(m.visible[m.cursor], false)
+			return m, m.open(m.visible[m.cursor], false)
 		}
 	case "/":
 		m.filtering = true
@@ -328,26 +360,22 @@ func (m Model) updateReader(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if m.digits != "" {
 			n, _ := strconv.Atoi(m.digits)
 			m.digits = ""
-			m.follow(n)
-			return m, nil
+			return m, m.follow(n)
 		}
 	case "esc":
 		if m.digits != "" || m.status != "" {
 			m.digits, m.status = "", ""
 			return m, nil
 		}
-		m.back()
-		return m, nil
+		return m, m.back()
 	case "backspace":
 		if m.digits != "" {
 			m.digits = m.digits[:len(m.digits)-1]
 			return m, nil
 		}
-		m.back()
-		return m, nil
+		return m, m.back()
 	case "q", "h", "left":
-		m.back()
-		return m, nil
+		return m, m.back()
 	case "g", "home":
 		m.vp.GotoTop()
 		return m, nil
@@ -364,84 +392,106 @@ func (m Model) updateReader(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m *Model) follow(n int) {
+func (m *Model) follow(n int) tea.Cmd {
 	if n < 1 || n > len(m.doc.Links) {
 		m.status = fmt.Sprintf("No link [%d]", n)
-		return
+		return nil
 	}
 	link := m.doc.Links[n-1]
 	if e := m.site.Lookup(link.URL); e != nil {
-		m.open(e, true)
-		return
+		return m.open(e, true)
 	}
 	m.status = "Link [" + strconv.Itoa(n) + "] " + link.URL
 	if render.Clickable(link.URL) {
 		m.status = "Link [" + strconv.Itoa(n) + "] " + ansi.SetHyperlink(link.URL) + link.URL + ansi.ResetHyperlink()
 	}
+	return nil
 }
 
-func (m *Model) open(e *content.Entry, push bool) {
+func (m *Model) open(e *content.Entry, push bool) tea.Cmd {
 	// A click can open an entry while the search box has focus.
 	if m.filtering {
 		m.filtering = false
 		m.filter.Blur()
 	}
 	if push && m.entry != nil {
-		m.history = append(m.history, m.entry)
+		m.history = append(m.history, visit{m.entry, readingPosition(m.vp)})
 	}
 	m.entry = e
 	m.screen = screenReader
 	m.digits, m.status = "", ""
-	m.renderEntry(true)
+	return m.renderEntry(0)
 }
 
-func (m *Model) back() {
+func (m *Model) back() tea.Cmd {
 	m.digits, m.status = "", ""
 	if n := len(m.history); n > 0 {
-		m.entry = m.history[n-1]
+		v := m.history[n-1]
 		m.history = m.history[:n-1]
-		m.renderEntry(true)
-		return
+		m.entry = v.entry
+		return m.renderEntry(v.pos)
 	}
 	m.entry = nil
 	m.screen = screenList
 	m.syncSite()
+	return nil
 }
 
-func (m *Model) renderEntry(top bool) {
-	w := min(m.width, maxReadWidth)
+func (m *Model) currentKey() renderKey {
+	return renderKey{m.entry.RenderID(), min(m.width, maxReadWidth), m.dark}
+}
+
+// renderEntry shows the current entry at reading position pos, from 0 at
+// the top to 1 at the bottom. A large body that isn't cached renders in
+// the background, and the returned command delivers it.
+func (m *Model) renderEntry(pos float64) tea.Cmd {
 	m.vp.SetWidth(m.width)
 	m.vp.SetHeight(max(m.height-1, 1))
+	key := m.currentKey()
+	opts := render.Options{Width: key.width, Dark: m.dark, BaseURL: m.entry.BaseURL()}
+	if doc, ok := render.Peek(key.id, opts); ok || len(m.entry.Body) < syncRender {
+		if !ok {
+			doc = renderDoc(m.entry, opts)
+		}
+		m.show(doc, pos)
+		return nil
+	}
+	m.doc = render.Document{}
+	m.vp.SetContent(m.header() + "\n  " + m.st.dim.Render("Rendering…") + "\n")
+	e := m.entry
+	return func() tea.Msg {
+		return renderedMsg{key: key, doc: renderDoc(e, opts), pos: pos}
+	}
+}
 
-	doc, err := render.Cached(m.entry.RenderID(), m.entry.Body, render.Options{Width: w, Dark: m.dark, BaseURL: m.entry.BaseURL()})
+func renderDoc(e *content.Entry, opts render.Options) render.Document {
+	doc, err := render.Cached(e.RenderID(), e.Body, opts)
 	if err != nil {
 		// The body is sanitized markdown, but render failed, so show it
 		// unstyled rather than nothing.
-		doc = render.Document{Content: m.entry.Body}
+		doc = render.Document{Content: e.Body}
 	}
-	m.doc = doc
+	return doc
+}
 
+// header is the entry's title and date block above its text.
+func (m *Model) header() string {
+	w := min(m.width, maxReadWidth)
 	var b strings.Builder
-	pad := "  "
-	b.WriteString("\n" + pad + m.st.title.Render(ansi.Truncate(m.entry.Title, max(w-4, 10), "…")) + "\n")
+	b.WriteString("\n  " + m.st.title.Render(ansi.Truncate(m.entry.Title, max(w-4, 10), "…")) + "\n")
 	if meta := entryMeta(m.entry); meta != "" {
-		b.WriteString(pad + m.st.dim.Render(meta) + "\n")
+		b.WriteString("  " + m.st.dim.Render(meta) + "\n")
 	}
-	b.WriteString(doc.Content)
-	b.WriteString("\n")
+	return b.String()
+}
 
-	// Rewrapping changes the line count, so keep the reading position as a
-	// fraction of the document rather than a line number.
-	pos := readingPosition(m.vp)
-	if m.resizing {
-		pos, m.resizing = m.keepPos, false
-	}
-	m.vp.SetContent(b.String())
-	if top {
-		m.vp.GotoTop()
-	} else {
-		m.vp.SetYOffset(int(pos * float64(max(m.vp.TotalLineCount()-m.vp.Height(), 0))))
-	}
+// show puts a rendered document in the viewport at reading position pos.
+// Rewrapping changes the line count, so the position is a fraction of the
+// document rather than a line number.
+func (m *Model) show(doc render.Document, pos float64) {
+	m.doc = doc
+	m.vp.SetContent(m.header() + doc.Content + "\n")
+	m.vp.SetYOffset(int(pos * float64(max(m.vp.TotalLineCount()-m.vp.Height(), 0))))
 }
 
 // readingPosition is how far down the document the viewport is, from 0 at

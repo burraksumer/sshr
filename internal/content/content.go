@@ -3,7 +3,6 @@
 package content
 
 import (
-	"net"
 	"net/url"
 	"strings"
 	"time"
@@ -93,20 +92,28 @@ type Site struct {
 
 // Lookup returns the entry for rawURL, or nil if the site has none.
 func (s *Site) Lookup(rawURL string) *Entry {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return nil
+	if k, ok := key(rawURL); ok {
+		return s.byURL[k]
 	}
-	return s.byURL[normalize(u)]
+	return nil
 }
 
 func (s *Site) index() {
 	s.byURL = make(map[string]*Entry, len(s.Entries))
 	for _, e := range s.Entries {
-		if u, err := url.Parse(e.URL); err == nil {
-			s.byURL[normalize(u)] = e
+		if k, ok := key(e.URL); ok {
+			s.byURL[k] = e
 		}
 	}
+}
+
+// key is the comparison key for a raw URL, see normalize.
+func key(raw string) (string, bool) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", false
+	}
+	return normalize(u), true
 }
 
 // normalize returns a comparison key for u. It uses https and a lowercase
@@ -115,17 +122,9 @@ func (s *Site) index() {
 func normalize(u *url.URL) string {
 	c := *u
 	c.Scheme = strings.ToLower(c.Scheme)
-	// Hosts compare in punycode, as fetching uses them, so links written
-	// with a Unicode host find entries read from the punycode one.
-	host := strings.TrimPrefix(fetch.HostKey(u.Hostname()), "www.")
-	switch {
-	case u.Port() != "":
-		c.Host = net.JoinHostPort(host, u.Port())
-	case strings.Contains(host, ":"):
-		c.Host = "[" + host + "]"
-	default:
-		c.Host = host
-	}
+	// Hosts compare in the form fetching uses, so links written with a
+	// Unicode host find entries read from the punycode one.
+	c.Host = strings.TrimPrefix(fetch.ASCIIHost(u).Host, "www.")
 	c.Fragment = ""
 	c.RawFragment = ""
 	c.Path = strings.TrimSuffix(c.Path, "/")

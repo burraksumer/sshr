@@ -97,3 +97,35 @@ func TestPasteIntoSearch(t *testing.T) {
 		t.Errorf("filter %q, %d visible", got.filter.Value(), len(got.visible))
 	}
 }
+
+// Going back after following a link returns to the reading position.
+func TestBackKeepsPosition(t *testing.T) {
+	long := &content.Entry{URL: "https://x.example/a", Body: strings.Repeat("line\n\n", 300)}
+	other := &content.Entry{URL: "https://x.example/b", Body: "short"}
+	m := Model{st: newStyles(true), width: 80, height: 20, vp: viewport.New()}
+	m.open(long, false)
+	m.vp.SetYOffset(400)
+	before := m.vp.YOffset()
+	m.open(other, true)
+	m.back()
+	if got := m.vp.YOffset(); got < before-2 || got > before+2 {
+		t.Errorf("offset after back = %d, want about %d", got, before)
+	}
+}
+
+// A large body renders off the event loop and shows once it arrives.
+func TestLargeBodyRendersInBackground(t *testing.T) {
+	big := &content.Entry{URL: "https://x.example/big", Body: strings.Repeat("word ", syncRender/4)}
+	m := Model{st: newStyles(true), width: 80, height: 20, vp: viewport.New()}
+	cmd := m.open(big, false)
+	if cmd == nil {
+		t.Fatal("large body rendered inline")
+	}
+	if len(m.doc.Content) != 0 {
+		t.Error("document shown before the render finished")
+	}
+	next, _ := m.Update(cmd())
+	if got := next.(Model); len(got.doc.Content) == 0 {
+		t.Error("render never shown")
+	}
+}

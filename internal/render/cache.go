@@ -109,6 +109,12 @@ func (c *docCache) put(k cacheKey, doc Document, extra int) {
 	}
 }
 
+// Peek returns the cached render for id and opts, if there is one, without
+// rendering.
+func Peek(id any, opts Options) (Document, bool) {
+	return shared.get(cacheKey{id: id, base: opts.BaseURL, width: opts.Width, dark: opts.Dark})
+}
+
 // Cached is Markdown with a cache shared by all callers. id names the
 // document, and must change whenever md does.
 func Cached(id any, md string, opts Options) (doc Document, err error) {

@@ -406,7 +406,7 @@ func TestDottedCapitalINotAllowed(t *testing.T) {
 	if HostKey("İ.com") == "i.com" {
 		t.Error("HostKey folds İ to i")
 	}
-	if got := asciiHost(mustURL(t, "https://bücher.de:8443/x")).Host; got != "xn--bcher-kva.de:8443" {
+	if got := ASCIIHost(mustURL(t, "https://bücher.de:8443/x")).Host; got != "xn--bcher-kva.de:8443" {
 		t.Errorf("asciiHost = %q", got)
 	}
 }
@@ -455,5 +455,13 @@ func TestMovedKeptOnPassingFailure(t *testing.T) {
 	c.mu.Unlock()
 	if !ok {
 		t.Error("remembered redirect dropped on a 503")
+	}
+}
+
+func TestXHTMLWithDeclarationConverted(t *testing.T) {
+	body := append([]byte(`<?xml version="1.0" encoding="iso-8859-9"?><html><body><p>`), 0xFE, 0xF0, '<', '/', 'p', '>')
+	got := toUTF8(body, "application/xhtml+xml", "application/xhtml+xml; charset=iso-8859-9")
+	if !strings.Contains(string(got), "şğ") {
+		t.Errorf("XHTML not converted: %q", got)
 	}
 }

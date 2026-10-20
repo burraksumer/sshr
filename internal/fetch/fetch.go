@@ -177,7 +177,7 @@ func (c *Client) StartRound() {
 // earlier copy is kept without a request, so EndRound doesn't drop them.
 func (c *Client) Keep(rawURL string) {
 	if u, err := url.Parse(rawURL); err == nil {
-		c.touch(asciiHost(u).String())
+		c.touch(ASCIIHost(u).String())
 	}
 }
 
@@ -188,7 +188,7 @@ func (c *Client) Forget(rawURL string) {
 	if err != nil {
 		return
 	}
-	key := asciiHost(u).String()
+	key := ASCIIHost(u).String()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if m, ok := c.moved[key]; ok {
@@ -321,8 +321,9 @@ func robotsError(u *url.URL, unavailable bool) error {
 	return fmt.Errorf("%w: %q", ErrDisallowed, u)
 }
 
-// asciiHost returns u with its host in HostKey form.
-func asciiHost(u *url.URL) *url.URL {
+// ASCIIHost returns u with its host in HostKey form, the form sshr compares,
+// keys and dials hosts in.
+func ASCIIHost(u *url.URL) *url.URL {
 	c := *u
 	if p := u.Port(); p != "" {
 		c.Host = net.JoinHostPort(HostKey(u.Hostname()), p)
@@ -337,7 +338,7 @@ func asciiHost(u *url.URL) *url.URL {
 // origin identifies whose robots.txt applies to u.
 func origin(u *url.URL) string {
 	// The dialed form, so rules are stored under the host they came from.
-	a := asciiHost(u)
+	a := ASCIIHost(u)
 	return strings.ToLower(a.Scheme) + "://" + a.Host
 }
 
@@ -468,8 +469,8 @@ func (c *Client) GetLarge(ctx context.Context, u *url.URL, accept string, condit
 func (c *Client) get(ctx context.Context, u *url.URL, accept string, conditional, checkRobots bool, maxBytes int64) (*Response, error) {
 	// A URL that moved permanently is asked for at its new place, so a
 	// conditional request can get a 304 instead of a redirect.
-	// Keys use the asciiHost form, the same one do stores validators under.
-	start := asciiHost(u).String()
+	// Keys use the ASCIIHost form, the same one do stores validators under.
+	start := ASCIIHost(u).String()
 	// A URL that was asked for keeps its validators, even if the request
 	// fails before it is sent, like during a robots.txt outage.
 	c.touch(start)
@@ -482,11 +483,11 @@ func (c *Client) get(ctx context.Context, u *url.URL, accept string, conditional
 			// Keep the mapping only while the new place answers directly.
 			// If it redirects elsewhere or is gone, forget it, and when it
 			// is gone, the old URL may work again.
-			if err == nil && (res.NotModified || res.Status == http.StatusOK) && res.URL.String() == asciiHost(to).String() {
+			if err == nil && (res.NotModified || res.Status == http.StatusOK) && res.URL.String() == ASCIIHost(to).String() {
 				return res, nil
 			}
 			// A passing failure says nothing about where the URL lives.
-			if err != nil || (res.Status != http.StatusNotFound && res.Status != http.StatusGone && res.URL.String() == asciiHost(to).String()) {
+			if err != nil || (res.Status != http.StatusNotFound && res.Status != http.StatusGone && res.URL.String() == ASCIIHost(to).String()) {
 				return res, err
 			}
 			c.mu.Lock()
@@ -520,7 +521,7 @@ func (c *Client) follow(ctx context.Context, u *url.URL, start, accept string, c
 		}
 		// Request the host in the exact form that was checked, so the name
 		// net/http dials is the allowlisted one by construction.
-		u = asciiHost(u)
+		u = ASCIIHost(u)
 		if checkRobots {
 			if allowed, unavailable := c.robotsAllow(ctx, u); !allowed {
 				return nil, robotsError(u, unavailable)
@@ -563,9 +564,12 @@ func toUTF8(body []byte, mediaType, header string) []byte {
 	default:
 		return body
 	}
-	// XML declares its own encoding, which feed and sitemap parsers read,
-	// so converting it here would decode it twice.
-	if bytes.HasPrefix(bytes.TrimLeft(bytes.TrimPrefix(body, []byte("\xef\xbb\xbf")), " \t\r\n"), []byte("<?xml")) {
+	// A feed or sitemap sent as plain text declares its own encoding,
+	// which its parser reads, so converting it here would decode it twice.
+	// HTML and XHTML pages are always converted, since the page readers
+	// expect UTF-8.
+	isPage := mediaType == "text/html" || mediaType == "application/xhtml+xml"
+	if !isPage && bytes.HasPrefix(bytes.TrimLeft(bytes.TrimPrefix(body, []byte("\xef\xbb\xbf")), " \t\r\n"), []byte("<?xml")) {
 		return body
 	}
 	// Without a declared charset, valid UTF-8 stays as it is. The charset
@@ -642,6 +646,8 @@ func (c *Client) do(ctx context.Context, u *url.URL, accept string, conditional,
 		if err != nil || res.Header.Get("Location") == "" {
 			return nil, nil, 0, fmt.Errorf("%w: %q redirects to an invalid location", ErrPermanent, u)
 		}
+		// Reading the rest of a short body lets the connection be reused.
+		_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, 64<<10))
 		return nil, next, res.StatusCode, nil
 	case http.StatusNotModified:
 		// Only trust a 304 that answers validators we sent. Callers keep

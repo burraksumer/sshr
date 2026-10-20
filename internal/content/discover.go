@@ -224,14 +224,9 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 	seen := map[string]bool{normalize(d.Base): true}
 	// When the site URL names a file, its directory is the same listing.
 	seen[normalize(d.Base.ResolveReference(&url.URL{Path: scope}))] = true
-	if feedURL != "" {
-		if u, err := url.Parse(feedURL); err == nil {
-			seen[normalize(u)] = true
-		}
-	}
-	for _, e := range entries {
-		if u, err := url.Parse(e.URL); err == nil {
-			seen[normalize(u)] = true
+	for _, raw := range append([]string{feedURL}, entryURLs(entries)...) {
+		if k, ok := key(raw); ok && raw != "" {
+			seen[k] = true
 		}
 	}
 	if room := maxEntries - len(entries); room > 0 {
@@ -283,6 +278,14 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 		return nil, errors.New("no readable content found. The site has no feed, sitemap or extractable pages")
 	}
 	return finish(site, kept), nil
+}
+
+func entryURLs(entries []*Entry) []string {
+	out := make([]string, len(entries))
+	for i, e := range entries {
+		out[i] = e.URL
+	}
+	return out
 }
 
 // finish sorts entries, fills missing titles and indexes the site.
@@ -399,11 +402,12 @@ func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []feedLink,
 				if err != nil || !inScope(u, scope) {
 					continue
 				}
-				key := normalize(u)
-				if seenItem[key] {
+				// An item linking to the homepage itself isn't a post.
+				k := normalize(u)
+				if seenItem[k] || k == normalize(d.Base) {
 					continue
 				}
-				seenItem[key] = true
+				seenItem[k] = true
 			}
 			entries = append(entries, e)
 		}
@@ -604,6 +608,12 @@ func (d *Discoverer) fillBody(ctx context.Context, e *Entry, old *Entry) error {
 	}
 	hasOld := old != nil && old.Body != ""
 	res, err := d.Client.Get(ctx, u, acceptPage, hasOld)
+	// A page that now redirects to the homepage, a login page outside the
+	// site's path and so on isn't this entry anymore.
+	if err == nil && res.Status == 200 && d.redirectedAway(u, res.URL) {
+		d.Client.Forget(e.URL)
+		return fmt.Errorf("redirects away to %q", res.URL)
+	}
 	switch {
 	case keepPrevious(res, err, hasOld):
 		reuse(e, old)
@@ -644,6 +654,16 @@ func (d *Discoverer) fillBody(ctx context.Context, e *Entry, old *Entry) error {
 	return nil
 }
 
+// redirectedAway reports whether a request for from ended at a different
+// page that can't stand in for it: the site's homepage, or somewhere
+// outside the site's path.
+func (d *Discoverer) redirectedAway(from, to *url.URL) bool {
+	if normalize(from) == normalize(to) {
+		return false
+	}
+	return normalize(to) == normalize(d.Base) || !inScope(to, d.scope())
+}
+
 // keepPrevious reports whether a fetch result means an earlier copy should
 // be kept: a 304, a 5xx or 429, or an error that isn't a refusal. It needs
 // an earlier copy to keep.
@@ -671,12 +691,7 @@ func (d *Discoverer) readPage(e *Entry, res *fetch.Response) error {
 		if e.Title == "" {
 			e.Title = firstHeading(body)
 		}
-		if t := parseDate(date); !t.IsZero() {
-			if e.Date.IsZero() || !e.fromFeed {
-				e.Date = t
-			}
-			e.Kind = Post
-		}
+		applyPublished(e, parseDate(date))
 		e.Body, e.fetchedAt = capBody(body), time.Now()
 		return nil
 	case "text/html", "application/xhtml+xml", "":
@@ -703,15 +718,23 @@ func (d *Discoverer) readPage(e *Entry, res *fetch.Response) error {
 	if e.Summary == "" {
 		e.Summary = sanitize.Line(article.Excerpt())
 	}
-	// A page with a published date in its metadata is a post the feed
-	// didn't include, such as an older one.
-	if t, err := article.PublishedTime(); err == nil && !t.IsZero() {
-		if e.Date.IsZero() || !e.fromFeed {
-			e.Date = t
-		}
-		e.Kind = Post
+	if t, err := article.PublishedTime(); err == nil {
+		applyPublished(e, t)
 	}
 	return nil
+}
+
+// applyPublished records a published date found on a page. It makes the
+// entry a post the feed didn't include, such as an older one. The feed's
+// own date wins over the page's.
+func applyPublished(e *Entry, t time.Time) {
+	if t.IsZero() {
+		return
+	}
+	if e.Date.IsZero() || !e.fromFeed {
+		e.Date = t
+	}
+	e.Kind = Post
 }
 
 // reuse copies old's page content into e, keeping the feed's own fields.
