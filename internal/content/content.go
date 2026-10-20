@@ -58,6 +58,7 @@ type Site struct {
 	FetchedAt   time.Time
 
 	feedURL                    string
+	feedStale                  int // refreshes in a row the feed was unreadable
 	feedTitle, feedDescription string
 	// feedEntries holds every entry from the feed, including those dropped
 	// because their page couldn't be fetched, so a refresh that gets 304

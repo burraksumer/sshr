@@ -334,7 +334,7 @@ func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []feedLink,
 		site.probeAge = prev.probeAge + 1
 	}
 	parser := gofeed.NewParser()
-	prevFailed := false
+	prevFailed, garbage := false, false
 	for _, raw := range candidates {
 		u, err := url.Parse(raw)
 		if err != nil {
@@ -361,9 +361,11 @@ func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []feedLink,
 		}
 		feed, err := parser.Parse(bytes.NewReader(res.Body))
 		if err != nil {
-			// An HTML maintenance page in place of the feed, say.
-			if prev != nil && raw == prev.feedURL {
-				prevFailed = true
+			// An HTML maintenance page in place of the feed, say. Keep the
+			// old entries for a few refreshes, not forever.
+			d.Client.Forget(raw)
+			if prev != nil && raw == prev.feedURL && prev.feedStale < maxStale {
+				prevFailed, garbage = true, true
 			}
 			continue
 		}
@@ -409,7 +411,12 @@ func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []feedLink,
 	// rather than dropping every post until the next refresh.
 	if prevFailed && prev.feedEntries != nil {
 		log.Warn("feed unavailable, keeping previous entries", "url", prev.feedURL)
-		return reuseFeed(site, prev), prev.feedURL
+		kept := reuseFeed(site, prev)
+		site.feedStale = prev.feedStale
+		if garbage {
+			site.feedStale++
+		}
+		return kept, prev.feedURL
 	}
 	// The feed went away, for good or for a moment. Probe the common paths
 	// again next refresh instead of waiting reprobeEvery refreshes.
@@ -549,22 +556,29 @@ func (d *Discoverer) fillBodies(ctx context.Context, entries []*Entry, prev *Sit
 			}
 		})
 	}
+	// The budget also bounds waiting for a free worker.
+	timer := time.NewTimer(time.Until(deadline))
+	passed := false
 	skipped := 0
 	for _, e := range todo {
 		// Past the budget, entries keep last refresh's copy, if there is
 		// one, and get fetched in a later refresh.
-		if time.Now().After(deadline) {
-			skipped++
-			if old := olds[e]; old != nil {
-				reuse(e, old)
+		if !passed {
+			select {
+			case jobs <- e:
+				continue
+			case <-timer.C:
+				passed = true
+			case <-ctx.Done():
+				continue
 			}
-			continue
 		}
-		select {
-		case jobs <- e:
-		case <-ctx.Done():
+		skipped++
+		if old := olds[e]; old != nil {
+			reuse(e, old)
 		}
 	}
+	timer.Stop()
 	close(jobs)
 	wg.Wait()
 	if skipped > 0 {
@@ -586,7 +600,9 @@ func (d *Discoverer) fillBody(ctx context.Context, e *Entry, old *Entry) error {
 			return fmt.Errorf("kept previous copy: %w", err)
 		}
 		if res.NotModified {
-			e.fetchedAt = time.Now()
+			// Validators only survive readable responses, so a 304
+			// means the copy is current.
+			e.fetchedAt, e.stale = time.Now(), 0
 		}
 		return nil
 	case err != nil:
@@ -595,6 +611,8 @@ func (d *Discoverer) fillBody(ctx context.Context, e *Entry, old *Entry) error {
 		return fmt.Errorf("status %d", res.Status)
 	}
 	if err := d.readPage(e, res); err != nil {
+		// A 304 must not vouch for this response later.
+		d.Client.Forget(e.URL)
 		// The page answered but couldn't be read, which may not get
 		// better. Keep the old copy for a few refreshes, not forever.
 		if hasOld && old.stale < maxStale {
@@ -685,7 +703,7 @@ func (d *Discoverer) readPage(e *Entry, res *fetch.Response) error {
 
 // reuse copies old's page content into e, keeping the feed's own fields.
 func reuse(e, old *Entry) {
-	e.Body, e.fetchedAt = old.Body, old.fetchedAt
+	e.Body, e.fetchedAt, e.stale = old.Body, old.fetchedAt, old.stale
 	// Feed entries are posts whatever the page looked like last time.
 	if !e.fromFeed {
 		e.Kind = old.Kind
@@ -775,11 +793,13 @@ func (d *Discoverer) loadSitemaps(ctx context.Context, roots []string, prev *Sit
 			switch {
 			case isSitemap:
 				c = parseSitemap(doc, res.URL, scope, maxURLs)
-			case hasOld:
+			case hasOld && old.stale < maxStale:
 				// Not a sitemap, like an error page sent with status 200.
 				// Well-formed HTML parses as XML, so the root element
-				// decides.
+				// decides. Keep the old copy for a few refreshes.
+				d.Client.Forget(raw)
 				c = old
+				c.stale++
 			default:
 				continue
 			}
@@ -804,6 +824,7 @@ func (d *Discoverer) loadSitemaps(ctx context.Context, roots []string, prev *Sit
 type cachedSitemap struct {
 	children []string
 	pages    []sitemapURL
+	stale    int // refreshes in a row it came back unreadable
 }
 
 // parseSitemap resolves a sitemap's URLs against base and keeps child

@@ -1131,6 +1131,13 @@ func TestStaleCopyExpires(t *testing.T) {
 	})
 	mux.HandleFunc("/p", func(w http.ResponseWriter, r *http.Request) {
 		if broken.Load() {
+			// An ETag on the unreadable response must not let a 304
+			// keep the old copy alive.
+			w.Header().Set("ETag", `"pdf"`)
+			if r.Header.Get("If-None-Match") == `"pdf"` {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
 			w.Header().Set("Content-Type", "application/pdf")
 			w.Write([]byte("%PDF"))
 			return
@@ -1172,5 +1179,48 @@ func TestCancelledRefreshFails(t *testing.T) {
 	cancel()
 	if _, err := d.Discover(ctx, nil, nil); err == nil {
 		t.Error("cancelled refresh reported success")
+	}
+}
+
+// A feed that keeps coming back unreadable loses its old entries after
+// maxStale refreshes.
+func TestGarbageFeedExpires(t *testing.T) {
+	var broken atomic.Bool
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("/feed.xml", func(w http.ResponseWriter, r *http.Request) {
+		if broken.Load() {
+			w.Header().Set("Content-Type", "text/html")
+			w.Write([]byte("<html>app shell</html>"))
+			return
+		}
+		w.Write([]byte(`<?xml version="1.0"?><rss version="2.0"><channel><item><title>P</title><link>` + srv.URL + `/p</link><content:encoded xmlns:content="http://purl.org/rss/1.0/modules/content/">Body</content:encoded></item></channel></rss>`))
+	})
+	mux.HandleFunc("/sitemap.xml", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`<?xml version="1.0"?><urlset><url><loc>/about</loc></url></urlset>`))
+	})
+	mux.HandleFunc("/about", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/markdown")
+		w.Write([]byte("About\n"))
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+	base, _ := url.Parse(srv.URL + "/")
+	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Host}, Rate: 1000, Burst: 100}), Base: base}
+	site, err := d.Discover(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	broken.Store(true)
+	if site, err = d.Discover(context.Background(), site, nil); err != nil || site.Lookup(srv.URL+"/p") == nil {
+		t.Fatalf("post dropped on the first bad round: %v", err)
+	}
+	for i := 0; i < maxStale; i++ {
+		if site, err = d.Discover(context.Background(), site, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if site.Lookup(srv.URL+"/p") != nil {
+		t.Error("posts from an unreadable feed kept forever")
 	}
 }

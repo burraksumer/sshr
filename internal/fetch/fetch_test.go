@@ -421,3 +421,39 @@ func TestRobotsOriginUsesDialedHost(t *testing.T) {
 		t.Errorf("origin = %q", got)
 	}
 }
+
+// XML keeps its own encoding declaration for its parser, whatever the
+// Content-Type says.
+func TestToUTF8LeavesXML(t *testing.T) {
+	body := append([]byte(`<?xml version="1.0" encoding="ISO-8859-9"?><rss><t>`), 0xE7, '<', '/', 't', '>')
+	if got := toUTF8(body, "text/plain", "text/plain; charset=iso-8859-9"); string(got) != string(body) {
+		t.Errorf("XML converted: %q", got)
+	}
+}
+
+// A passing failure at a remembered redirect target keeps the mapping.
+func TestMovedKeptOnPassingFailure(t *testing.T) {
+	var down atomic.Bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/post", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/post/", http.StatusMovedPermanently)
+	})
+	mux.HandleFunc("/post/", func(w http.ResponseWriter, r *http.Request) {
+		if down.Load() {
+			http.Error(w, "busy", http.StatusServiceUnavailable)
+			return
+		}
+		w.Write([]byte("page"))
+	})
+	srv, c := testServer(t, mux.ServeHTTP)
+	ctx := context.Background()
+	c.Get(ctx, mustURL(t, srv.URL+"/post"), "", false)
+	down.Store(true)
+	c.Get(ctx, mustURL(t, srv.URL+"/post"), "", true)
+	c.mu.Lock()
+	_, ok := c.moved[srv.URL+"/post"]
+	c.mu.Unlock()
+	if !ok {
+		t.Error("remembered redirect dropped on a 503")
+	}
+}

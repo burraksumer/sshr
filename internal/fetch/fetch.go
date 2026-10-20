@@ -97,9 +97,9 @@ type Client struct {
 	moved      map[string]moved // permanent redirects, by original URL
 	round      int
 
-	// robotsMu serializes robots.txt fetches so each origin is fetched once
-	// per round.
-	robotsMu sync.Mutex
+	// robotsLocks serializes robots.txt fetches per origin, so each origin
+	// is fetched once per round without making other origins wait.
+	robotsLocks map[string]*sync.Mutex
 }
 
 // moved records where a URL redirected to permanently.
@@ -136,14 +136,15 @@ func New(opts Options) *Client {
 		opts.Timeout = 15 * time.Second
 	}
 	c := &Client{
-		hosts:      map[string]bool{},
-		limiter:    rate.NewLimiter(rate.Limit(opts.Rate), opts.Burst),
-		rate:       rate.Limit(opts.Rate),
-		burst:      opts.Burst,
-		maxBytes:   opts.MaxBytes,
-		robots:     map[string]robotsEntry{},
-		validators: map[string]validators{},
-		moved:      map[string]moved{},
+		hosts:       map[string]bool{},
+		limiter:     rate.NewLimiter(rate.Limit(opts.Rate), opts.Burst),
+		rate:        rate.Limit(opts.Rate),
+		burst:       opts.Burst,
+		maxBytes:    opts.MaxBytes,
+		robots:      map[string]robotsEntry{},
+		robotsLocks: map[string]*sync.Mutex{},
+		validators:  map[string]validators{},
+		moved:       map[string]moved{},
 	}
 	for _, h := range opts.Hosts {
 		host, ports, err := ParseHost(h)
@@ -177,6 +178,22 @@ func (c *Client) Keep(rawURL string) {
 	if u, err := url.Parse(rawURL); err == nil {
 		c.touch(asciiHost(u).String())
 	}
+}
+
+// Forget drops the validators for rawURL. Callers use it when they reject a
+// response, so a later 304 can't vouch for a body they couldn't use.
+func (c *Client) Forget(rawURL string) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return
+	}
+	key := asciiHost(u).String()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if m, ok := c.moved[key]; ok {
+		delete(c.validators, m.to)
+	}
+	delete(c.validators, key)
 }
 
 // touch marks the validators and remembered redirect for key, a URL in
@@ -321,8 +338,9 @@ func (c *Client) robotsFor(ctx context.Context, u *url.URL) robotsEntry {
 	if ok && e.round == round {
 		return e
 	}
-	c.robotsMu.Lock()
-	defer c.robotsMu.Unlock()
+	lock := c.robotsLock(key)
+	lock.Lock()
+	defer lock.Unlock()
 	c.mu.Lock()
 	e, ok = c.robots[key]
 	c.mu.Unlock()
@@ -331,6 +349,17 @@ func (c *Client) robotsFor(ctx context.Context, u *url.URL) robotsEntry {
 	}
 	e, _ = c.fetchRobots(ctx, u)
 	return e
+}
+
+func (c *Client) robotsLock(key string) *sync.Mutex {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	l, ok := c.robotsLocks[key]
+	if !ok {
+		l = &sync.Mutex{}
+		c.robotsLocks[key] = l
+	}
+	return l
 }
 
 // fetchRobots fetches and stores robots.txt for u's origin.
@@ -389,9 +418,10 @@ func (c *Client) robotsAllow(ctx context.Context, u *url.URL) (allowed, unavaila
 // allows everything. One that can't be fetched disallows everything, and
 // LoadRobots returns the error.
 func (c *Client) LoadRobots(ctx context.Context, base *url.URL) ([]string, error) {
-	c.robotsMu.Lock()
+	lock := c.robotsLock(origin(base))
+	lock.Lock()
 	e, err := c.fetchRobots(ctx, base)
-	c.robotsMu.Unlock()
+	lock.Unlock()
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrRobotsUnavailable, err)
 	}
@@ -432,10 +462,6 @@ func (c *Client) get(ctx context.Context, u *url.URL, accept string, conditional
 	if conditional {
 		c.mu.Lock()
 		m, ok := c.moved[start]
-		if ok {
-			m.round = c.round
-			c.moved[start] = m
-		}
 		c.mu.Unlock()
 		if to, err := url.Parse(m.to); ok && err == nil {
 			res, err := c.follow(ctx, to, start, accept, conditional, checkRobots, maxBytes)
@@ -444,6 +470,10 @@ func (c *Client) get(ctx context.Context, u *url.URL, accept string, conditional
 			// is gone, the old URL may work again.
 			if err == nil && (res.NotModified || res.Status == http.StatusOK) && res.URL.String() == asciiHost(to).String() {
 				return res, nil
+			}
+			// A passing failure says nothing about where the URL lives.
+			if err != nil || (res.Status != http.StatusNotFound && res.Status != http.StatusGone && res.URL.String() == asciiHost(to).String()) {
+				return res, err
 			}
 			c.mu.Lock()
 			// Unless following it just recorded a newer permanent target.
@@ -513,6 +543,11 @@ func toUTF8(body []byte, mediaType, header string) []byte {
 	switch mediaType {
 	case "text/html", "application/xhtml+xml", "text/markdown", "text/x-markdown", "text/plain", "":
 	default:
+		return body
+	}
+	// XML declares its own encoding, which feed and sitemap parsers read,
+	// so converting it here would decode it twice.
+	if bytes.HasPrefix(bytes.TrimLeft(bytes.TrimPrefix(body, []byte("\xef\xbb\xbf")), " \t\r\n"), []byte("<?xml")) {
 		return body
 	}
 	// Without a declared charset, valid UTF-8 stays as it is. The charset
