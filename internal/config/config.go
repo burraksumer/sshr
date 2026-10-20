@@ -13,6 +13,7 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/burraksumer/sshr/internal/content"
 	"github.com/burraksumer/sshr/internal/fetch"
+	"github.com/pires/go-proxyproto"
 )
 
 // Config is the full sshr configuration. Only URL is required.
@@ -121,10 +122,9 @@ func (c Config) Validate() error {
 	if c.ProxyProtocol && len(c.TrustedProxies) == 0 {
 		return errors.New("proxy_protocol needs trusted_proxies, or every connection is rejected")
 	}
-	for _, p := range c.TrustedProxies {
-		if _, _, err := net.ParseCIDR(p); err != nil && net.ParseIP(p) == nil {
-			return fmt.Errorf("trusted_proxies: %q is not an IP address or CIDR range", p)
-		}
+	// The same parser the listener uses, so what passes here works there.
+	if _, err := proxyproto.TrustProxyHeaderFromRanges(c.TrustedProxies); err != nil {
+		return fmt.Errorf("trusted_proxies: %w", err)
 	}
 	if c.LogFormat != "json" && c.LogFormat != "text" {
 		return fmt.Errorf(`log_format must be "json" or "text", got %q`, c.LogFormat)

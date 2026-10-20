@@ -80,7 +80,7 @@ func startServer(t *testing.T) string {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	go srv.ListenAndServe(ctx)
+	go srv.ListenAndServe(ctx, nil)
 	for range 50 {
 		if c, err := net.Dial("tcp", addr); err == nil {
 			c.Close()

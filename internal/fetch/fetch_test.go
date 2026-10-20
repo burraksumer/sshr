@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -288,5 +289,50 @@ func TestNoValidatorsOnLaterHops(t *testing.T) {
 	}
 	if res.NotModified || string(res.Body) != "new page" {
 		t.Errorf("got 304 = %v, body %q, want the full new page", res.NotModified, res.Body)
+	}
+}
+
+// UTF-8 with no declared charset stays UTF-8 even when the first kilobyte is
+// plain ASCII.
+func TestUTF8WithoutCharsetUnchanged(t *testing.T) {
+	body := strings.Repeat("a", 1100) + " Sümer"
+	for _, ct := range []string{"text/markdown", "text/html", "text/plain"} {
+		if got := string(toUTF8([]byte(body), ct, ct)); got != body {
+			t.Errorf("%s: got %q", ct, got[len(got)-12:])
+		}
+	}
+}
+
+// After a permanent redirect, a conditional request goes straight to the new
+// URL and can get a 304.
+func TestMovedURLRequestedDirectly(t *testing.T) {
+	var oldHits atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/post", func(w http.ResponseWriter, r *http.Request) {
+		oldHits.Add(1)
+		http.Redirect(w, r, "/post/", http.StatusMovedPermanently)
+	})
+	mux.HandleFunc("/post/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"p"`)
+		if r.Header.Get("If-None-Match") == `"p"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Write([]byte("page"))
+	})
+	srv, c := testServer(t, mux.ServeHTTP)
+	ctx := context.Background()
+	c.StartRound()
+	if _, err := c.Get(ctx, mustURL(t, srv.URL+"/post"), "", false); err != nil {
+		t.Fatal(err)
+	}
+	c.EndRound()
+	c.StartRound()
+	res, err := c.Get(ctx, mustURL(t, srv.URL+"/post"), "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.NotModified || oldHits.Load() != 1 {
+		t.Errorf("304 = %v, old URL hits = %d, want a 304 and one hit", res.NotModified, oldHits.Load())
 	}
 }

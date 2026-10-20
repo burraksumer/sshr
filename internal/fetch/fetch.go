@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/temoto/robotstxt"
 	"golang.org/x/net/html/charset"
@@ -92,11 +93,18 @@ type Client struct {
 	mu         sync.Mutex
 	robots     map[string]robotsEntry // by origin
 	validators map[string]validators
+	moved      map[string]moved // permanent redirects, by original URL
 	round      int
 
 	// robotsMu serializes robots.txt fetches so each origin is fetched once
 	// per round.
 	robotsMu sync.Mutex
+}
+
+// moved records where a URL redirected to permanently.
+type moved struct {
+	to    string
+	round int
 }
 
 type robotsEntry struct {
@@ -134,6 +142,7 @@ func New(opts Options) *Client {
 		maxBytes:   opts.MaxBytes,
 		robots:     map[string]robotsEntry{},
 		validators: map[string]validators{},
+		moved:      map[string]moved{},
 	}
 	for _, h := range opts.Hosts {
 		host, ports, err := ParseHost(h)
@@ -166,6 +175,11 @@ func (c *Client) StartRound() {
 func (c *Client) Keep(rawURL string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if m, ok := c.moved[rawURL]; ok {
+		m.round = c.round
+		c.moved[rawURL] = m
+		rawURL = m.to
+	}
 	if v, ok := c.validators[rawURL]; ok {
 		v.round = c.round
 		c.validators[rawURL] = v
@@ -179,6 +193,11 @@ func (c *Client) EndRound() {
 	for k, v := range c.validators {
 		if v.round < c.round {
 			delete(c.validators, k)
+		}
+	}
+	for k, m := range c.moved {
+		if m.round < c.round {
+			delete(c.moved, k)
 		}
 	}
 }
@@ -353,6 +372,21 @@ func (c *Client) GetLarge(ctx context.Context, u *url.URL, accept string, condit
 }
 
 func (c *Client) get(ctx context.Context, u *url.URL, accept string, conditional, checkRobots bool, maxBytes int64) (*Response, error) {
+	// A URL that moved permanently is asked for at its new place, so a
+	// conditional request can get a 304 instead of a redirect.
+	start := u.String()
+	if conditional {
+		c.mu.Lock()
+		if m, ok := c.moved[start]; ok {
+			m.round = c.round
+			c.moved[start] = m
+			if to, err := url.Parse(m.to); err == nil {
+				u = to
+			}
+		}
+		c.mu.Unlock()
+	}
+	permanent := true
 	// Redirects are followed here rather than by net/http, so every hop gets
 	// the allowlist and robots.txt checks, waits on the rate limiter, and has
 	// its own timeout that doesn't include that wait.
@@ -374,13 +408,19 @@ func (c *Client) get(ctx context.Context, u *url.URL, accept string, conditional
 		// Validators only go with the URL the caller asked for. A later hop
 		// may be a different page with its own validators, and a 304 for
 		// it would make the caller keep a stale copy.
-		res, next, err := c.do(ctx, u, accept, conditional && hop == 0, maxBytes)
+		res, next, status, err := c.do(ctx, u, accept, conditional && hop == 0, maxBytes)
 		if err != nil {
 			return nil, err
 		}
 		if next == nil {
+			if hop > 0 && permanent && res.Status == http.StatusOK {
+				c.mu.Lock()
+				c.moved[start] = moved{to: u.String(), round: c.round}
+				c.mu.Unlock()
+			}
 			return res, nil
 		}
+		permanent = permanent && (status == http.StatusMovedPermanently || status == http.StatusPermanentRedirect)
 		u = next
 	}
 }
@@ -393,6 +433,16 @@ func toUTF8(body []byte, mediaType, header string) []byte {
 	switch mediaType {
 	case "text/html", "application/xhtml+xml", "text/markdown", "text/x-markdown", "text/plain", "":
 	default:
+		return body
+	}
+	// Without a declared charset, valid UTF-8 stays as it is. The charset
+	// package only looks at the first 1024 bytes and would call an ASCII
+	// start windows-1252, garbling UTF-8 further down.
+	_, params, _ := mime.ParseMediaType(header)
+	if params["charset"] == "" && utf8.Valid(body) {
+		return body
+	}
+	if strings.EqualFold(params["charset"], "utf-8") {
 		return body
 	}
 	r, err := charset.NewReader(bytes.NewReader(body), header)
@@ -413,12 +463,12 @@ var errTooManyRedirects = errors.New("fetch: too many redirects")
 // do sends one request. For a redirect it returns the next URL instead of
 // a response. A positive maxBytes makes a larger body an error, and a
 // negative one cuts the body to -maxBytes bytes.
-func (c *Client) do(ctx context.Context, u *url.URL, accept string, conditional bool, maxBytes int64) (*Response, *url.URL, error) {
+func (c *Client) do(ctx context.Context, u *url.URL, accept string, conditional bool, maxBytes int64) (*Response, *url.URL, int, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	req.Header.Set("User-Agent", UserAgent)
 	if accept != "" {
@@ -444,7 +494,7 @@ func (c *Client) do(ctx context.Context, u *url.URL, accept string, conditional 
 
 	res, err := c.http.Do(req)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	defer res.Body.Close()
 
@@ -452,16 +502,16 @@ func (c *Client) do(ctx context.Context, u *url.URL, accept string, conditional 
 	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
 		next, err := u.Parse(res.Header.Get("Location"))
 		if err != nil || res.Header.Get("Location") == "" {
-			return nil, nil, fmt.Errorf("fetch: %q redirects to an invalid location", u)
+			return nil, nil, 0, fmt.Errorf("fetch: %q redirects to an invalid location", u)
 		}
-		return nil, next, nil
+		return nil, next, res.StatusCode, nil
 	case http.StatusNotModified:
 		// Only trust a 304 that answers validators we sent. Callers keep
 		// their previous result, which doesn't exist otherwise.
 		if !sent {
-			return nil, nil, fmt.Errorf("fetch: %q answered 304 to an unconditional request", u)
+			return nil, nil, 0, fmt.Errorf("fetch: %q answered 304 to an unconditional request", u)
 		}
-		return &Response{URL: u, Status: res.StatusCode, NotModified: true}, nil, nil
+		return &Response{URL: u, Status: res.StatusCode, NotModified: true}, nil, res.StatusCode, nil
 	}
 
 	out := &Response{URL: u, Status: res.StatusCode}
@@ -474,11 +524,11 @@ func (c *Client) do(ctx context.Context, u *url.URL, accept string, conditional 
 	}
 	body, err := io.ReadAll(io.LimitReader(res.Body, limit+1))
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	if int64(len(body)) > limit {
 		if maxBytes > 0 {
-			return nil, nil, fmt.Errorf("fetch: %q is larger than %d bytes", u, limit)
+			return nil, nil, 0, fmt.Errorf("fetch: %q is larger than %d bytes", u, limit)
 		}
 		// Cut at the last line break, so a rule isn't left half written.
 		body = body[:limit]
@@ -499,5 +549,5 @@ func (c *Client) do(ctx context.Context, u *url.URL, accept string, conditional 
 		}
 		c.mu.Unlock()
 	}
-	return out, nil, nil
+	return out, nil, res.StatusCode, nil
 }

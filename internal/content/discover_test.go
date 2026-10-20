@@ -985,3 +985,43 @@ func TestFeedEntriesKeepFeedFields(t *testing.T) {
 		t.Errorf("probeAge after losing the feed = %d, want %d", next.probeAge, reprobeEvery)
 	}
 }
+
+// A post pushed out of the feed, whose page has no published time, stays a
+// dated post.
+func TestPostLeavingFeedStaysPost(t *testing.T) {
+	var pushedOut atomic.Bool
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("/feed.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/feed+json")
+		item := `{"id":"1","url":"` + srv.URL + `/old","title":"Old","summary":"s","date_published":"2024-01-01T00:00:00Z"}`
+		if pushedOut.Load() {
+			item = `{"id":"2","url":"` + srv.URL + `/new","title":"New","content_text":"n","date_published":"2024-02-01T00:00:00Z"}`
+		}
+		w.Write([]byte(`{"version":"https://jsonfeed.org/version/1.1","items":[` + item + `]}`))
+	})
+	mux.HandleFunc("/sitemap.xml", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`<?xml version="1.0"?><urlset><url><loc>/old</loc></url></urlset>`))
+	})
+	mux.HandleFunc("/old", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/markdown")
+		w.Write([]byte("Old body\n"))
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+	base, _ := url.Parse(srv.URL + "/")
+	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Host}, Rate: 1000, Burst: 100}), Base: base}
+	site, err := d.Discover(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pushedOut.Store(true)
+	site, err = d.Discover(context.Background(), site, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := site.Lookup(srv.URL + "/old")
+	if e == nil || e.Kind != Post || e.Date.Year() != 2024 {
+		t.Errorf("old post = %+v, want a dated post", e)
+	}
+}

@@ -231,10 +231,15 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 
 	d.fillBodies(ctx, entries, prev, log)
 	site.feedEntries = feedEntries
-	// Pages kept from last round without a request keep their validators.
+	// Anything kept from last round without a request keeps its
+	// validators: pages, sitemaps and the feed.
 	for _, e := range entries {
 		d.Client.Keep(e.URL)
 	}
+	for raw := range site.sitemaps {
+		d.Client.Keep(raw)
+	}
+	d.Client.Keep(site.feedURL)
 
 	var kept []*Entry
 	for _, e := range entries {
@@ -388,11 +393,6 @@ func reuseFeed(site, prev *Site) []*Entry {
 	var kept []*Entry
 	for _, e := range prev.feedEntries {
 		c := *e
-		// Bodies fetched from pages get rechecked with a conditional
-		// request, and entries whose fetch failed get retried.
-		if c.pageBody {
-			c.Body, c.pageBody = "", false
-		}
 		kept = append(kept, &c)
 	}
 	applyFeedMeta(site, prev.feedTitle, prev.feedDescription)
@@ -569,6 +569,14 @@ func (d *Discoverer) fillBody(ctx context.Context, e *Entry, old *Entry) error {
 		}
 		return err
 	}
+	// A post that left the feed, say pushed out by newer ones, stays a
+	// dated post even when its page has no published time.
+	if e.Kind == Page && old != nil && old.Kind == Post {
+		e.Kind = Post
+		if e.Date.IsZero() || !old.Date.IsZero() {
+			e.Date = old.Date
+		}
+	}
 	return nil
 }
 
@@ -594,7 +602,7 @@ func (d *Discoverer) readPage(e *Entry, res *fetch.Response) error {
 		if e.Title == "" {
 			e.Title = firstHeading(body)
 		}
-		e.Body, e.pageBody, e.fetchedAt = capBody(body), true, time.Now()
+		e.Body, e.fetchedAt = capBody(body), time.Now()
 		return nil
 	case "text/html", "application/xhtml+xml", "":
 	default:
@@ -612,7 +620,7 @@ func (d *Discoverer) readPage(e *Entry, res *fetch.Response) error {
 	if err != nil {
 		return err
 	}
-	e.Body, e.pageBody, e.fetchedAt = capBody(sanitize.Text(string(md))), true, time.Now()
+	e.Body, e.fetchedAt = capBody(sanitize.Text(string(md))), time.Now()
 	if e.Title == "" {
 		e.Title = sanitize.Line(article.Title())
 	}
@@ -632,7 +640,7 @@ func (d *Discoverer) readPage(e *Entry, res *fetch.Response) error {
 
 // reuse copies old's page content into e, keeping the feed's own fields.
 func reuse(e, old *Entry) {
-	e.Body, e.pageBody, e.fetchedAt = old.Body, true, old.fetchedAt
+	e.Body, e.fetchedAt = old.Body, old.fetchedAt
 	// Feed entries are posts whatever the page looked like last time.
 	if !e.fromFeed {
 		e.Kind = old.Kind

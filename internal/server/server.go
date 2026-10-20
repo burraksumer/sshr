@@ -132,8 +132,9 @@ func New(cfg Config, store *content.Store, log *slog.Logger) (*Server, error) {
 	return &Server{srv: srv, cfg: cfg, log: log}, nil
 }
 
-// ListenAndServe serves until ctx is done, then shuts down gracefully.
-func (s *Server) ListenAndServe(ctx context.Context) error {
+// ListenAndServe serves until ctx is done, then shuts down gracefully. It
+// calls listening, if set, once the port is bound.
+func (s *Server) ListenAndServe(ctx context.Context, listening func()) error {
 	l, err := net.Listen("tcp", s.cfg.Listen)
 	if err != nil {
 		return err
@@ -146,6 +147,9 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		l = &proxyproto.Listener{Listener: l, ConnPolicy: policy, ReadHeaderTimeout: 5 * time.Second}
 	}
 	s.log.Info("listening", "addr", l.Addr().String(), "proxy_protocol", s.cfg.ProxyProtocol)
+	if listening != nil {
+		listening()
+	}
 
 	errc := make(chan error, 1)
 	go func() { errc <- s.srv.Serve(l) }()

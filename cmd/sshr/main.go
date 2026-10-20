@@ -98,8 +98,6 @@ func serve(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	go store.Run(ctx, cfg.Refresh.D())
-
 	srv, err := server.New(server.Config{
 		Listen:         cfg.Listen,
 		HostKeyPath:    cfg.HostKey,
@@ -113,7 +111,9 @@ func serve(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	return srv.ListenAndServe(ctx)
+	// Fetch the site only once the port is bound, so a startup failure in
+	// a restart loop doesn't refetch it each time.
+	return srv.ListenAndServe(ctx, func() { go store.Run(ctx, cfg.Refresh.D()) })
 }
 
 func read(ctx context.Context, args []string) error {
