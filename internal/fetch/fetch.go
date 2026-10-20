@@ -532,7 +532,11 @@ func (c *Client) follow(ctx context.Context, u *url.URL, start, accept string, c
 		// Validators only go with the URL the caller asked for. A later hop
 		// may be a different page with its own validators, and a 304 for
 		// it would make the caller keep a stale copy.
-		res, next, status, err := c.do(ctx, u, accept, conditional && hop == 0, maxBytes)
+		// Validators are only worth storing where a conditional request can
+		// send them: the first hop, or a target reached by permanent
+		// redirects. robots.txt is never asked for conditionally.
+		remember := checkRobots && (hop == 0 || permanent)
+		res, next, status, err := c.do(ctx, u, accept, conditional && hop == 0, remember, maxBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -587,12 +591,17 @@ func toUTF8(body []byte, mediaType, header string) []byte {
 
 const maxRedirects = 5
 
-var errTooManyRedirects = errors.New("fetch: too many redirects")
+var errTooManyRedirects = fmt.Errorf("%w: too many redirects", ErrPermanent)
+
+// ErrPermanent marks fetch errors that come back on every try: a body over
+// the size limit, too many redirects or a redirect to nowhere. Callers don't
+// keep old copies over them.
+var ErrPermanent = errors.New("fetch: permanent failure")
 
 // do sends one request. For a redirect it returns the next URL instead of
 // a response. A positive maxBytes makes a larger body an error, and a
 // negative one cuts the body to -maxBytes bytes.
-func (c *Client) do(ctx context.Context, u *url.URL, accept string, conditional bool, maxBytes int64) (*Response, *url.URL, int, error) {
+func (c *Client) do(ctx context.Context, u *url.URL, accept string, conditional, remember bool, maxBytes int64) (*Response, *url.URL, int, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
@@ -631,7 +640,7 @@ func (c *Client) do(ctx context.Context, u *url.URL, accept string, conditional 
 	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
 		next, err := u.Parse(res.Header.Get("Location"))
 		if err != nil || res.Header.Get("Location") == "" {
-			return nil, nil, 0, fmt.Errorf("fetch: %q redirects to an invalid location", u)
+			return nil, nil, 0, fmt.Errorf("%w: %q redirects to an invalid location", ErrPermanent, u)
 		}
 		return nil, next, res.StatusCode, nil
 	case http.StatusNotModified:
@@ -657,7 +666,7 @@ func (c *Client) do(ctx context.Context, u *url.URL, accept string, conditional 
 	}
 	if int64(len(body)) > limit {
 		if maxBytes > 0 {
-			return nil, nil, 0, fmt.Errorf("fetch: %q is larger than %d bytes", u, limit)
+			return nil, nil, 0, fmt.Errorf("%w: %q is larger than %d bytes", ErrPermanent, u, limit)
 		}
 		// Cut at the last line break, so a rule isn't left half written.
 		body = body[:limit]
@@ -667,7 +676,7 @@ func (c *Client) do(ctx context.Context, u *url.URL, accept string, conditional 
 	}
 	out.Body = toUTF8(body, out.ContentType, res.Header.Get("Content-Type"))
 
-	if res.StatusCode == http.StatusOK {
+	if res.StatusCode == http.StatusOK && remember {
 		v := validators{etag: res.Header.Get("ETag"), lastModified: res.Header.Get("Last-Modified")}
 		c.mu.Lock()
 		v.round, v.stored = c.round, c.round

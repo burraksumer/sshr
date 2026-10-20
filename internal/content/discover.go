@@ -7,9 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
-	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/url"
 	"path"
@@ -398,10 +396,14 @@ func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []feedLink,
 				}
 			} else {
 				u, err := url.Parse(e.URL)
-				if err != nil || !inScope(u, scope) || seenItem[normalize(u)] {
+				if err != nil || !inScope(u, scope) {
 					continue
 				}
-				seenItem[normalize(u)] = true
+				key := normalize(u)
+				if seenItem[key] {
+					continue
+				}
+				seenItem[key] = true
 			}
 			entries = append(entries, e)
 		}
@@ -455,24 +457,18 @@ func applyFeedMeta(site *Site, title, description string) {
 	}
 }
 
-// passing reports whether a fetch error is the kind that goes away, like a
-// timeout, a dropped connection or a robots.txt that can't be fetched right
-// now. Others, like a refusal, an oversized body or a redirect loop, come
-// back every time, so old copies aren't kept over them.
+// passing reports whether a fetch error may go away, so an old copy is
+// worth keeping over it: network trouble of any kind, or a robots.txt that
+// can't be fetched right now. A refusal by the allowlist or robots.txt, or a
+// failure fetch marks permanent, comes back every time.
 func passing(err error) bool {
-	var op *net.OpError
-	var ne net.Error
 	switch {
 	case errors.Is(err, fetch.ErrRobotsUnavailable):
 		return true
-	case errors.As(err, &op):
-		return true
-	case errors.As(err, &ne) && ne.Timeout():
-		return true
-	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, io.EOF):
-		return true
+	case errors.Is(err, fetch.ErrDisallowed), errors.Is(err, fetch.ErrNotAllowed), errors.Is(err, fetch.ErrPermanent):
+		return false
 	}
-	return false
+	return true
 }
 
 // transient reports whether an HTTP status is worth keeping old data over.

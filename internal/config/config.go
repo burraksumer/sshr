@@ -101,12 +101,8 @@ const MinRefresh = time.Minute
 
 // Validate checks values that would make sshr misbehave rather than fail.
 func (c Config) Validate() error {
-	site, err := c.SiteURL()
-	if err != nil {
+	if _, err := c.SiteURL(); err != nil {
 		return err
-	}
-	if fetch.HostKey(site.Hostname()) == "" {
-		return fmt.Errorf("site URL host %q is not a valid host name", site.Hostname())
 	}
 	if c.Refresh.D() < MinRefresh {
 		return fmt.Errorf("refresh must be at least %s, got %s", MinRefresh, c.Refresh.D())
@@ -168,6 +164,9 @@ func ParseSiteURL(raw string) (*url.URL, error) {
 	}
 	if u.Path == "" {
 		u.Path = "/"
+	}
+	if fetch.HostKey(u.Hostname()) == "" {
+		return nil, fmt.Errorf("site URL host %q is not a valid host name", u.Hostname())
 	}
 	return u, nil
 }

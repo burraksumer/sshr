@@ -301,3 +301,16 @@ func TestBareURLsNumbered(t *testing.T) {
 		t.Errorf("bare URL not numbered:\n%s", ansi.Strip(doc.Content))
 	}
 }
+
+func TestLinkNumbersFollowReadingOrder(t *testing.T) {
+	doc, err := Markdown("See [docs](https://a.example/x) or https://b.example/y.", Options{Width: 80})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Links) != 2 || doc.Links[0].URL != "https://a.example/x" {
+		t.Errorf("links = %+v", doc.Links)
+	}
+	if plain := ansi.Strip(doc.Content); !strings.Contains(plain, "docs [1]") || !strings.Contains(plain, "https://b.example/y [2]") {
+		t.Errorf("numbers out of order:\n%s", plain)
+	}
+}

@@ -90,8 +90,8 @@ func Markdown(md string, opts Options) (Document, error) {
 func numberLinks(doc ast.Node, source []byte, base string) ([]byte, []Link) {
 	var links []Link
 	byURL := map[string]int{}
-	var targets []*ast.Link
-	var autos []*ast.AutoLink
+	// Links and bare URLs, in reading order, so numbers follow the text.
+	var targets []ast.Node
 	_ = ast.Walk(doc, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
 		if !entering {
 			return ast.WalkContinue, nil
@@ -102,50 +102,45 @@ func numberLinks(doc ast.Node, source []byte, base string) ([]byte, []Link) {
 			return ast.WalkSkipChildren, nil
 		case *ast.AutoLink:
 			if n.AutoLinkType == ast.AutoLinkURL {
-				autos = append(autos, n)
+				targets = append(targets, n)
 			}
 		}
 		return ast.WalkContinue, nil
 	})
-	number := func(dest string) int {
+	for _, n := range targets {
+		var dest string
+		switch n := n.(type) {
+		case *ast.Link:
+			if dest = linkDestination(n.Destination); dest == "" || strings.HasPrefix(dest, "#") {
+				continue
+			}
+		case *ast.AutoLink:
+			dest = string(n.URL(source))
+		}
+		dest = resolve(base, dest)
+		// A link to a section of this same document, which html-to-markdown
+		// makes absolute, isn't worth a number. Show its text only.
+		if sameDocument(dest, base) {
+			if l, ok := n.(*ast.Link); ok {
+				l.Destination = []byte("#")
+			}
+			continue
+		}
 		num, ok := byURL[dest]
 		if !ok {
 			num = len(links) + 1
 			byURL[dest] = num
 			links = append(links, Link{N: num, URL: dest})
 		}
-		return num
-	}
-	// Bare URLs show their address already. They get a number too, so they
-	// can be followed like other links.
-	for _, a := range autos {
-		dest := resolve(base, string(a.URL(source)))
-		if sameDocument(dest, base) {
-			continue
-		}
-		var t *ast.Text
-		source, t = appendText(source, fmt.Sprintf(" [%d]", number(dest)))
-		a.Parent().InsertAfter(a.Parent(), a, t)
-	}
-	for _, l := range targets {
-		dest := linkDestination(l.Destination)
-		if dest == "" || strings.HasPrefix(dest, "#") {
-			continue
-		}
-		dest = resolve(base, dest)
-		// A link to a section of this same document, which html-to-markdown
-		// makes absolute, isn't worth a number. Show its text only.
-		if sameDocument(dest, base) {
+		// An anchor-only destination makes glamour render a link's text
+		// without printing the URL after it. Bare URLs show their address
+		// already and keep it.
+		if l, ok := n.(*ast.Link); ok {
 			l.Destination = []byte("#")
-			continue
 		}
-		num := number(dest)
-		// An anchor-only destination makes glamour render the text without
-		// printing the URL after it.
-		l.Destination = []byte("#")
 		var t *ast.Text
 		source, t = appendText(source, fmt.Sprintf(" [%d]", num))
-		l.Parent().InsertAfter(l.Parent(), l, t)
+		n.Parent().InsertAfter(n.Parent(), n, t)
 	}
 	return source, links
 }

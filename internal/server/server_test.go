@@ -170,3 +170,16 @@ func TestAgentForwardingRefused(t *testing.T) {
 		t.Errorf("agent forwarding request: ok=%v err=%v, want refused", ok, err)
 	}
 }
+
+func TestOnlyReaderRequestsAccepted(t *testing.T) {
+	c := dial(t, startServer(t))
+	s, err := c.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, req := range []string{"x11-req", "subsystem", "auth-agent-req@openssh.com", "made-up@example.com"} {
+		if ok, _ := s.SendRequest(req, true, nil); ok {
+			t.Errorf("%s accepted", req)
+		}
+	}
+}

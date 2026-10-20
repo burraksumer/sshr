@@ -1230,8 +1230,11 @@ func TestGarbageFeedExpires(t *testing.T) {
 // An error that comes back every time, like an oversized page, doesn't keep
 // the old copy. A timeout or dropped connection does.
 func TestPassing(t *testing.T) {
-	if passing(errors.New("fetch: \"x\" is larger than 5 bytes")) {
+	if passing(fmt.Errorf("%w: \"x\" is larger than 5 bytes", fetch.ErrPermanent)) {
 		t.Error("oversized page counted as passing")
+	}
+	if !passing(errors.New("http2: stream error: stream ID 3; INTERNAL_ERROR")) {
+		t.Error("a stream reset should keep the old copy")
 	}
 	if !passing(fmt.Errorf("x: %w", fetch.ErrRobotsUnavailable)) {
 		t.Error("robots outage not passing")
@@ -1278,5 +1281,12 @@ func TestFailedRefreshDiscardsValidators(t *testing.T) {
 	d.Discover(context.Background(), site, nil)
 	if conditional.Load() != 0 {
 		t.Error("validators from the failed refresh were sent")
+	}
+}
+
+func TestLookupAcrossUnicodeAndPunycode(t *testing.T) {
+	site := finish(&Site{}, []*Entry{{URL: "https://b%C3%BCcher.de/post", Body: "x"}})
+	if site.Lookup("https://xn--bcher-kva.de/post") == nil {
+		t.Error("punycode link didn't find the entry")
 	}
 }

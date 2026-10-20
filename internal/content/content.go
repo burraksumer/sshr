@@ -3,9 +3,12 @@
 package content
 
 import (
+	"net"
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/burraksumer/sshr/internal/fetch"
 )
 
 // Kind says whether an entry is a dated post or a standalone page.
@@ -112,7 +115,17 @@ func (s *Site) index() {
 func normalize(u *url.URL) string {
 	c := *u
 	c.Scheme = strings.ToLower(c.Scheme)
-	c.Host = strings.TrimPrefix(strings.ToLower(c.Host), "www.")
+	// Hosts compare in punycode, as fetching uses them, so links written
+	// with a Unicode host find entries read from the punycode one.
+	host := strings.TrimPrefix(fetch.HostKey(u.Hostname()), "www.")
+	switch {
+	case u.Port() != "":
+		c.Host = net.JoinHostPort(host, u.Port())
+	case strings.Contains(host, ":"):
+		c.Host = "[" + host + "]"
+	default:
+		c.Host = host
+	}
 	c.Fragment = ""
 	c.RawFragment = ""
 	c.Path = strings.TrimSuffix(c.Path, "/")

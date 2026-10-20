@@ -323,9 +323,11 @@ func sessionChannel(srv *ssh.Server, conn *gossh.ServerConn, newChan gossh.NewCh
 	ssh.DefaultSessionHandler(srv, conn, limitedChannel{newChan}, ctx)
 }
 
-// limitedChannel drops env requests past maxEnv or larger than maxEnvBytes,
-// and refuses agent forwarding, which the library would otherwise
-// acknowledge.
+// sessionRequests are the channel requests a reader session may make.
+var sessionRequests = map[string]bool{"pty-req": true, "env": true, "shell": true, "exec": true, "window-change": true}
+
+// limitedChannel passes on only sessionRequests, and drops env requests past
+// maxEnv or larger than maxEnvBytes.
 type limitedChannel struct{ gossh.NewChannel }
 
 func (c limitedChannel) Accept() (gossh.Channel, <-chan *gossh.Request, error) {
@@ -338,7 +340,9 @@ func (c limitedChannel) Accept() (gossh.Channel, <-chan *gossh.Request, error) {
 		defer close(out)
 		env := 0
 		for req := range reqs {
-			if req.Type == "auth-agent-req@openssh.com" {
+			// Only what a reader session needs. Anything else, like agent
+			// forwarding, which the library would acknowledge, is refused.
+			if !sessionRequests[req.Type] {
 				if req.WantReply {
 					_ = req.Reply(false, nil)
 				}
