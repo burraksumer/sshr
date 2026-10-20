@@ -357,3 +357,49 @@ func TestPage304KeepsFeedDate(t *testing.T) {
 		t.Errorf("entry after 304 = %+v", e)
 	}
 }
+
+// A page that fails with a 5xx keeps last refresh's copy, and www and bare
+// hosts count as one site.
+func TestTransientErrorKeepsPage(t *testing.T) {
+	var fail atomic.Bool
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("/feed.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/feed+json")
+		w.Write([]byte(`{"version":"https://jsonfeed.org/version/1.1","title":"T","items":[
+{"id":"1","url":"` + srv.URL + `/post","title":"Post","summary":"s"}]}`))
+	})
+	mux.HandleFunc("/post", func(w http.ResponseWriter, r *http.Request) {
+		if fail.Load() {
+			http.Error(w, "busy", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "text/markdown")
+		w.Write([]byte("Post body\n"))
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+
+	base, _ := url.Parse(srv.URL + "/")
+	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Host}, Rate: 1000, Burst: 100}), Base: base}
+	first, err := d.Discover(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fail.Store(true)
+	second, err := d.Discover(context.Background(), first, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e := second.Lookup(srv.URL + "/post"); e == nil || !strings.Contains(e.Body, "Post body") {
+		t.Errorf("post dropped after a 503: %+v", e)
+	}
+}
+
+func TestNormalizeFoldsWWW(t *testing.T) {
+	a, _ := url.Parse("https://www.example.com/post/")
+	b, _ := url.Parse("http://EXAMPLE.com/post#top")
+	if normalize(a) != normalize(b) {
+		t.Errorf("%q != %q", normalize(a), normalize(b))
+	}
+}

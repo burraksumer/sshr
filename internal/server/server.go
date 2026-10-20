@@ -11,8 +11,10 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/ssh"
@@ -21,6 +23,7 @@ import (
 	"charm.land/wish/v2/ratelimiter"
 	"github.com/burraksumer/sshr/internal/content"
 	"github.com/burraksumer/sshr/internal/ui"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/pires/go-proxyproto"
 	gossh "golang.org/x/crypto/ssh"
 	"golang.org/x/time/rate"
@@ -82,7 +85,7 @@ func New(cfg Config, store *content.Store, log *slog.Logger) (*Server, error) {
 			requirePTY(),
 			limitSessions(sessions),
 			// New sessions per IP: a burst of MaxPerIP, then one per second.
-			ratelimiter.Middleware(ratelimiter.NewRateLimiter(rate.Every(time.Second), cfg.MaxPerIP, 10_000)),
+			ratelimiter.Middleware(newRateLimiter(rate.Every(time.Second), cfg.MaxPerIP)),
 			logSessions(log),
 		),
 	)
@@ -92,7 +95,7 @@ func New(cfg Config, store *content.Store, log *slog.Logger) (*Server, error) {
 	srv.HandshakeTimeout = 15 * time.Second
 	srv.ConnCallback = func(ctx ssh.Context, c net.Conn) net.Conn {
 		ip := hostOf(c.RemoteAddr())
-		release, ok := conns.acquire(ip)
+		release, ok := conns.acquire(clientKey(ip))
 		if !ok {
 			log.Warn("connection refused", "ip", ip, "reason", "limit")
 			return nil
@@ -166,7 +169,7 @@ func requirePTY() wish.Middleware {
 func limitSessions(l *limiter) wish.Middleware {
 	return func(next ssh.Handler) ssh.Handler {
 		return func(s ssh.Session) {
-			release, ok := l.acquire(hostOf(s.RemoteAddr()))
+			release, ok := l.acquire(clientKey(hostOf(s.RemoteAddr())))
 			if !ok {
 				wish.Fatalln(s, "Too many readers right now. Try again in a minute.")
 				return
@@ -184,7 +187,7 @@ func logSessions(log *slog.Logger) wish.Middleware {
 			start := time.Now()
 			pty, _, _ := s.Pty()
 			ip := hostOf(s.RemoteAddr())
-			log.Info("session start", "ip", ip, "term", pty.Term, "cols", pty.Window.Width, "rows", pty.Window.Height)
+			log.Info("session start", "ip", ip, "term", safeTerm(pty.Term), "cols", pty.Window.Width, "rows", pty.Window.Height)
 			next(s)
 			log.Info("session end", "ip", ip, "seconds", int(time.Since(start).Seconds()))
 		}
@@ -232,6 +235,57 @@ type trackedConn struct {
 func (c *trackedConn) Close() error {
 	c.release()
 	return c.Conn.Close()
+}
+
+// clientKey is what the per-client limits count. IPv6 clients are grouped by
+// /64, the smallest block an ISP usually hands out, so one host can't look
+// like millions of clients.
+func clientKey(ip string) string {
+	addr := net.ParseIP(ip)
+	if addr == nil || addr.To4() != nil {
+		return ip
+	}
+	return addr.Mask(net.CIDRMask(64, 128)).String() + "/64"
+}
+
+// safeTerm keeps the visitor-supplied TERM value to characters terminal names
+// use, so logs can't carry control characters.
+func safeTerm(t string) string {
+	t = strings.Map(func(r rune) rune {
+		if r < 0x80 && (r == '-' || r == '.' || r == '_' || r == '+' || unicode.IsLetter(r) || unicode.IsDigit(r)) {
+			return r
+		}
+		return '?'
+	}, t)
+	if len(t) > 64 {
+		t = t[:64]
+	}
+	return t
+}
+
+// rateLimiter limits new sessions per client key: a burst, then a steady rate.
+type rateLimiter struct {
+	rate  rate.Limit
+	burst int
+	cache *lru.Cache[string, *rate.Limiter]
+}
+
+func newRateLimiter(r rate.Limit, burst int) *rateLimiter {
+	cache, _ := lru.New[string, *rate.Limiter](10_000)
+	return &rateLimiter{rate: r, burst: burst, cache: cache}
+}
+
+func (r *rateLimiter) Allow(s ssh.Session) error {
+	key := clientKey(hostOf(s.RemoteAddr()))
+	l, ok := r.cache.Get(key)
+	if !ok {
+		l = rate.NewLimiter(r.rate, r.burst)
+		r.cache.Add(key, l)
+	}
+	if !l.Allow() {
+		return ratelimiter.ErrRateLimitExceeded
+	}
+	return nil
 }
 
 func hostOf(a net.Addr) string {

@@ -67,12 +67,13 @@ func (s *Site) index() {
 	}
 }
 
-// normalize returns a comparison key for u: lowercase scheme and host, no
-// fragment, no trailing slash.
+// normalize returns a comparison key for u: https, lowercase host without
+// "www.", no fragment, no trailing slash. sshr treats a site's www and bare
+// hosts as the same site.
 func normalize(u *url.URL) string {
 	c := *u
 	c.Scheme = strings.ToLower(c.Scheme)
-	c.Host = strings.ToLower(c.Host)
+	c.Host = strings.TrimPrefix(strings.ToLower(c.Host), "www.")
 	c.Fragment = ""
 	c.RawFragment = ""
 	c.Path = strings.TrimSuffix(c.Path, "/")

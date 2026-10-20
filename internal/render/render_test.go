@@ -44,6 +44,8 @@ func TestWrapsToWidth(t *testing.T) {
 	}
 }
 
+var evilLink = regexp.MustCompile("\x1b]8;[^\x07\x1b]*evil")
+
 var glamourLinks = regexp.MustCompile("\x1b]8;id=[0-9]+;[^\x07]*\x07|\x1b]8;;\x07")
 
 // Character references that decode to control characters must not reach the
@@ -60,6 +62,16 @@ func TestControlReferences(t *testing.T) {
 		"C1 &#157;0;title&#7; and &#155;31m",
 		"emphasis *&#27;[5mblink*",
 		"![alt &#27;[31m](https://example.com/i.png)",
+		// References split by inline markup inside strikethrough, which
+		// glamour decodes from the joined text of its children.
+		"~~&`#`27;]8;;https://evil.example/&`#`7;official docs&`#`27;]8;;&`#`7;~~",
+		"~~&[#](#a)27;[31mX~~",
+		"~~&![#](x.png)27;[31mX~~",
+		"~~&`#2`7;[31mX~~ and ~~&`#x`1b;[31mX~~",
+		"~~&`#`8238;evil~~ bidi",
+		"| a | b |\n|---|---|\n| &#27;[31m | [x](https://x.example) |",
+		"<p>&amp;#27;[31m</p>",
+		"raw OSC 8 with an id: &#27;]8;id=1;https://evil.example&#7;x",
 	}
 	for _, p := range payloads {
 		doc, err := Markdown(p, Options{Width: 80, Dark: true})
@@ -68,9 +80,13 @@ func TestControlReferences(t *testing.T) {
 		}
 		// Glamour's own output is SGR styling plus OSC 8 links it builds
 		// itself, which always carry an id. Remove those; no other OSC
-		// sequence, BEL or C1 control may be left.
+		// sequence, BEL, C1 control or bidi override may be left, and no
+		// link may point at the attacker's host.
+		if evilLink.MatchString(doc.Content) {
+			t.Errorf("%q: hyperlink to evil.example:\n%q", p, doc.Content)
+		}
 		out := glamourLinks.ReplaceAllString(doc.Content, "")
-		for _, bad := range []string{"\x1b]", "\x07", "\x1b[2J", "\x1b[31m", "\x1b[5m", "\u009d", "\u009b"} {
+		for _, bad := range []string{"\x1b]", "\x07", "\x1b[2J", "\x1b[31m", "\x1b[5m", "\u009d", "\u009b", "\u202e"} {
 			if strings.Contains(out, bad) {
 				t.Errorf("%q: output contains %q:\n%q", p, bad, out)
 			}
@@ -86,5 +102,33 @@ func TestControlReferencesShownLiterally(t *testing.T) {
 	plain := ansi.Strip(doc.Content)
 	if strings.Count(plain, "&#27;") != 3 || !strings.Contains(plain, "é") {
 		t.Errorf("references not shown as written:\n%s", plain)
+	}
+}
+
+func TestFilterOutput(t *testing.T) {
+	targets := map[string]bool{"https://ok.example": true}
+	in := "a\x1b[38;5;252mb\x1b[m" + // SGR kept
+		"\x1b]8;id=1;https://ok.example\x07ok\x1b]8;;\x07" + // known link kept
+		"\x1b]8;id=2;https://evil.example\x07bad\x1b]8;;\x07" + // unknown link dropped
+		"\x1b]0;title\x07\x1b]52;c;aGk=\x1b\\" + // other OSC dropped
+		"\x1b[2J\x1b[H\x1bc" + // other CSI and ESC sequences dropped
+		"\u009b31m‮\x07\x1b" // C1, bidi, BEL, lone ESC dropped
+	want := "a\x1b[38;5;252mb\x1b[m\x1b]8;id=1;https://ok.example\x07ok\x1b]8;;\x07bad\x1b]8;;\x0731m"
+	if got := filterOutput(in, targets); got != want {
+		t.Errorf("filterOutput:\n got %q\nwant %q", got, want)
+	}
+}
+
+func TestTableLinksNumbered(t *testing.T) {
+	md := "See [Go](https://go.dev).\n\n| name | link |\n|---|---|\n| spec | [spec](https://example.com/spec) |\n"
+	doc, err := Markdown(md, Options{Width: 80})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Links) != 2 || doc.Links[1].URL != "https://example.com/spec" {
+		t.Fatalf("links = %+v", doc.Links)
+	}
+	if plain := ansi.Strip(doc.Content); !strings.Contains(plain, "spec [2]") {
+		t.Errorf("table link not numbered [2]:\n%s", plain)
 	}
 }

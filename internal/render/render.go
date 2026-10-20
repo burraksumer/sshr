@@ -56,8 +56,9 @@ func Markdown(md string, opts Options) (Document, error) {
 		goldmark.WithExtensions(extension.GFM, extension.DefinitionList),
 		goldmark.WithParserOptions(parser.WithAutoHeadingID()),
 	)
-	source := escapeControlRefs(gm.Parser(), []byte(md))
+	source := []byte(md)
 	doc := gm.Parser().Parse(text.NewReader(source))
+	source = cleanTree(doc, source)
 
 	var links []Link
 	source, links = numberLinks(doc, source, opts.BaseURL)
@@ -69,12 +70,16 @@ func Markdown(md string, opts Options) (Document, error) {
 		BaseURL:  opts.BaseURL,
 		WordWrap: width - 2*margin,
 		Styles:   style,
+		// Table links get numbered like the rest instead of getting their
+		// own per-table footer.
+		InlineTableLinks: true,
 	}), 1000)))
 	var buf bytes.Buffer
 	if err := r.Render(&buf, source, doc); err != nil {
 		return Document{}, err
 	}
-	return Document{Content: strings.TrimRight(buf.String(), "\n"), Links: links}, nil
+	out := filterOutput(buf.String(), hyperlinkTargets(doc, source))
+	return Document{Content: strings.TrimRight(out, "\n"), Links: links}, nil
 }
 
 // numberLinks rewrites every inline link so it renders as its text followed by
@@ -96,7 +101,7 @@ func numberLinks(doc ast.Node, source []byte, base string) ([]byte, []Link) {
 	})
 	for _, l := range targets {
 		dest := string(l.Destination)
-		if dest == "" || strings.HasPrefix(dest, "#") || isInTable(l) {
+		if dest == "" || strings.HasPrefix(dest, "#") {
 			continue
 		}
 		dest = resolve(base, dest)
@@ -157,14 +162,4 @@ func nodeText(n ast.Node, source []byte) string {
 		return ast.WalkContinue, nil
 	})
 	return b.String()
-}
-
-// Glamour already numbers links inside tables, so those are left alone.
-func isInTable(n ast.Node) bool {
-	for p := n.Parent(); p != nil; p = p.Parent() {
-		if p.Kind().String() == "Table" {
-			return true
-		}
-	}
-	return false
 }

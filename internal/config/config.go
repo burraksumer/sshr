@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -102,6 +103,11 @@ func (c Config) Validate() error {
 			return fmt.Errorf("%s must be positive, got %d", name, n)
 		}
 	}
+	for _, h := range c.AllowedHosts {
+		if err := checkHost(h); err != nil {
+			return fmt.Errorf("allowed_hosts: %w", err)
+		}
+	}
 	if c.ProxyProtocol && len(c.TrustedProxies) == 0 {
 		return errors.New("proxy_protocol needs trusted_proxies, or every connection is rejected")
 	}
@@ -167,6 +173,27 @@ func (c Config) Hosts(site *url.URL) []string {
 		hosts = append(hosts, strings.ToLower(strings.TrimSpace(a)))
 	}
 	return hosts
+}
+
+// checkHost accepts "host" or "host:port", without a scheme or path.
+func checkHost(h string) error {
+	h = strings.TrimSpace(h)
+	if strings.ContainsAny(h, "/@?# ") {
+		return fmt.Errorf("%q should be a host like cdn.example.com or cdn.example.com:8443, without a scheme or path", h)
+	}
+	host, port, err := net.SplitHostPort(h)
+	if err != nil {
+		host, port = strings.Trim(h, "[]"), ""
+	}
+	if host == "" || strings.ContainsAny(host, "/:@?#% ") && net.ParseIP(host) == nil {
+		return fmt.Errorf("%q should be a host like cdn.example.com or cdn.example.com:8443, without a scheme or path", h)
+	}
+	if port != "" {
+		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+			return fmt.Errorf("%q has an invalid port", h)
+		}
+	}
+	return nil
 }
 
 // hasLetters reports whether h is a DNS name rather than an IP address.

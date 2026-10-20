@@ -75,3 +75,20 @@ func TestHostsKeepPort(t *testing.T) {
 		t.Errorf("Hosts = %v", got)
 	}
 }
+
+func TestValidateAllowedHosts(t *testing.T) {
+	c := Default()
+	c.URL = "example.com"
+	for _, ok := range []string{"cdn.example.com", "cdn.example.com:8443", "192.0.2.1", "[::1]:9000"} {
+		c.AllowedHosts = []string{ok}
+		if err := c.Validate(); err != nil {
+			t.Errorf("%q: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"https://cdn.example.com", "cdn.example.com/feeds", "cdn.example.com:0", "cdn.example.com:http", ""} {
+		c.AllowedHosts = []string{bad}
+		if c.Validate() == nil {
+			t.Errorf("%q: no error", bad)
+		}
+	}
+}

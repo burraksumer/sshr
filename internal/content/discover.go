@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"net/url"
 	"path"
 	"regexp"
@@ -72,9 +73,7 @@ type Discoverer struct {
 	Base   *url.URL
 	// MaxEntries caps how many documents a site may have.
 	MaxEntries int
-	// Workers is how many pages are fetched at once.
-	Workers int
-	Log     *slog.Logger
+	Log        *slog.Logger
 }
 
 // Discover fetches the site and returns a new snapshot. prev is the last
@@ -143,7 +142,7 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 				break
 			}
 			key := normalize(p.loc)
-			if seen[key] || !inScope(p.loc, scope) || !d.Client.Allowed(p.loc) || !readablePath(p.loc.Path) {
+			if seen[key] || !inScope(p.loc, scope) || !d.Client.Allowed(ctx, p.loc) || !readablePath(p.loc.Path) {
 				continue
 			}
 			seen[key] = true
@@ -227,23 +226,16 @@ func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []string, p
 		if err != nil {
 			continue
 		}
-		conditional := prev != nil && prev.feedURL == raw
+		// Only ask for a 304 when there are feed entries to fall back on.
+		conditional := prev != nil && prev.feedURL == raw && prev.feedEntries != nil
 		res, err := d.Client.GetLarge(ctx, u, acceptFeed, conditional)
 		if err != nil {
 			log.Debug("feed", "url", raw, "err", err)
 			continue
 		}
 		if res.NotModified && prev != nil {
-			src := prev.feedEntries
-			if src == nil {
-				for _, e := range prev.Entries {
-					if e.fromFeed {
-						src = append(src, e)
-					}
-				}
-			}
 			var kept []*Entry
-			for _, e := range src {
+			for _, e := range prev.feedEntries {
 				c := *e
 				// Bodies fetched from pages get rechecked with a conditional
 				// request, and entries whose fetch failed get retried.
@@ -333,10 +325,7 @@ func entryFromItem(item *gofeed.Item, feedURL *url.URL) *Entry {
 
 // fillBodies fetches the page for every entry that has no body yet.
 func (d *Discoverer) fillBodies(ctx context.Context, entries []*Entry, prev *Site, log *slog.Logger) {
-	workers := d.Workers
-	if workers <= 0 {
-		workers = 4
-	}
+	const workers = 4
 	jobs := make(chan *Entry)
 	var wg sync.WaitGroup
 	for range workers {
@@ -369,26 +358,23 @@ func (d *Discoverer) fillBody(ctx context.Context, e *Entry, old *Entry) error {
 	if err != nil {
 		return err
 	}
-	res, err := d.Client.Get(ctx, u, acceptPage, old != nil && old.Body != "")
-	if err != nil {
+	hasOld := old != nil && old.Body != ""
+	res, err := d.Client.Get(ctx, u, acceptPage, hasOld)
+	switch {
+	case err != nil && hasOld && !errors.Is(err, fetch.ErrDisallowed) && !errors.Is(err, fetch.ErrNotAllowed):
+		// A timeout or connection error. Keep last refresh's copy rather
+		// than dropping the entry until the next refresh.
+		reuse(e, old)
+		return fmt.Errorf("kept previous copy: %w", err)
+	case err != nil:
 		return err
-	}
-	if res.NotModified && old != nil {
-		e.Body, e.Kind, e.pageBody = old.Body, old.Kind, true
-		if e.Title == "" {
-			e.Title = old.Title
-		}
-		if e.Summary == "" {
-			e.Summary = old.Summary
-		}
-		// Keep the feed's date, as a 200 would. Pages take the date the
-		// article metadata gave last time.
-		if e.Date.IsZero() || (old.Kind == Post && !e.fromFeed) {
-			e.Date = old.Date
-		}
+	case res.NotModified && hasOld:
+		reuse(e, old)
 		return nil
-	}
-	if res.Status != 200 {
+	case (res.Status >= 500 || res.Status == http.StatusTooManyRequests) && hasOld:
+		reuse(e, old)
+		return fmt.Errorf("status %d, kept previous copy", res.Status)
+	case res.Status != 200:
 		return fmt.Errorf("status %d", res.Status)
 	}
 
@@ -434,6 +420,22 @@ func (d *Discoverer) fillBody(ctx context.Context, e *Entry, old *Entry) error {
 	return nil
 }
 
+// reuse copies old's page content into e, keeping the feed's own fields.
+func reuse(e, old *Entry) {
+	e.Body, e.Kind, e.pageBody = old.Body, old.Kind, true
+	if e.Title == "" {
+		e.Title = old.Title
+	}
+	if e.Summary == "" {
+		e.Summary = old.Summary
+	}
+	// Keep the feed's date, as a fresh fetch would. Pages take the date the
+	// article metadata gave last time.
+	if e.Date.IsZero() || (old.Kind == Post && !e.fromFeed) {
+		e.Date = old.Date
+	}
+}
+
 type sitemapURL struct {
 	loc     *url.URL
 	lastmod time.Time
@@ -457,7 +459,7 @@ func (d *Discoverer) loadSitemaps(ctx context.Context, roots []string, log *slog
 	// template, say). Keep the ones that resolve to an allowed URL.
 	var queue []string
 	for _, r := range roots {
-		if u, err := d.Base.Parse(strings.TrimSpace(r)); err == nil && d.Client.Allowed(u) {
+		if u, err := d.Base.Parse(strings.TrimSpace(r)); err == nil && d.Client.Allowed(ctx, u) {
 			queue = append(queue, u.String())
 		}
 	}
@@ -489,7 +491,7 @@ func (d *Discoverer) loadSitemaps(ctx context.Context, roots []string, log *slog
 			continue
 		}
 		for _, s := range doc.Sitemaps {
-			if child, err := res.URL.Parse(strings.TrimSpace(s.Loc)); err == nil && d.Client.Allowed(child) {
+			if child, err := res.URL.Parse(strings.TrimSpace(s.Loc)); err == nil && d.Client.Allowed(ctx, child) {
 				queue = append(queue, child.String())
 			}
 		}

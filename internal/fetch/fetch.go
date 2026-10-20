@@ -74,10 +74,24 @@ type Client struct {
 	maxBytes int64
 
 	mu         sync.Mutex
-	robots     *robotstxt.Group
+	robots     map[string]robotsEntry // by origin
 	validators map[string]validators
 	round      int
+
+	// robotsMu serializes robots.txt fetches so each origin is fetched once
+	// per round.
+	robotsMu sync.Mutex
 }
+
+type robotsEntry struct {
+	data  *robotstxt.RobotsData
+	round int
+}
+
+// disallowAll is used when robots.txt can't be fetched. RFC 9309 treats an
+// unreachable robots.txt as a full disallow, like a 5xx. The rule lives on
+// RobotsData, not on its groups, so callers must use TestAgent.
+var disallowAll, _ = robotstxt.FromStatusAndBytes(http.StatusServiceUnavailable, nil)
 
 // skipRobots marks requests, and so their redirects, that ignore robots.txt.
 // Only the robots.txt fetch itself uses it.
@@ -103,6 +117,7 @@ func New(opts Options) *Client {
 		rate:       rate.Limit(opts.Rate),
 		burst:      opts.Burst,
 		maxBytes:   opts.MaxBytes,
+		robots:     map[string]robotsEntry{},
 		validators: map[string]validators{},
 	}
 	for _, h := range opts.Hosts {
@@ -124,7 +139,7 @@ func New(opts Options) *Client {
 			if err := c.checkURL(req.URL); err != nil {
 				return err
 			}
-			if req.Context().Value(skipRobots{}) == nil && !c.robotsAllow(req.URL) {
+			if req.Context().Value(skipRobots{}) == nil && !c.robotsAllow(req.Context(), req.URL) {
 				return fmt.Errorf("%w: redirect to %s", ErrDisallowed, req.URL)
 			}
 			return nil
@@ -133,8 +148,9 @@ func New(opts Options) *Client {
 	return c
 }
 
-// StartRound begins a refresh. Validators not used again before EndRound are
-// forgotten, so URLs that left the site don't pile up.
+// StartRound begins a refresh. robots.txt files are fetched again, and
+// validators not used again before EndRound are forgotten, so URLs that left
+// the site don't pile up.
 func (c *Client) StartRound() {
 	c.mu.Lock()
 	c.round++
@@ -152,9 +168,10 @@ func (c *Client) EndRound() {
 	}
 }
 
-// Allowed reports whether u is on the allowlist and not blocked by robots.txt.
-func (c *Client) Allowed(u *url.URL) bool {
-	return c.checkURL(u) == nil && c.robotsAllow(u)
+// Allowed reports whether u is on the allowlist and not blocked by its host's
+// robots.txt, which it fetches if needed.
+func (c *Client) Allowed(ctx context.Context, u *url.URL) bool {
+	return c.checkURL(u) == nil && c.robotsAllow(ctx, u)
 }
 
 func (c *Client) checkURL(u *url.URL) error {
@@ -166,18 +183,60 @@ func (c *Client) checkURL(u *url.URL) error {
 		port = map[string]string{"http": "80", "https": "443"}[u.Scheme]
 	}
 	if !c.hosts[net.JoinHostPort(strings.ToLower(u.Hostname()), port)] {
-		return fmt.Errorf("%w: %s", ErrNotAllowed, u.Host)
+		return fmt.Errorf("%w: %q", ErrNotAllowed, u.Host)
 	}
 	return nil
 }
 
-func (c *Client) robotsAllow(u *url.URL) bool {
+// origin identifies whose robots.txt applies to u.
+func origin(u *url.URL) string {
+	return strings.ToLower(u.Scheme + "://" + u.Host)
+}
+
+// robotsFor returns the robots.txt rules for u's origin, fetching them once
+// per round.
+func (c *Client) robotsFor(ctx context.Context, u *url.URL) *robotstxt.RobotsData {
+	key := origin(u)
 	c.mu.Lock()
-	g := c.robots
+	e, ok := c.robots[key]
+	round := c.round
 	c.mu.Unlock()
-	if g == nil {
-		return true
+	if ok && e.round == round {
+		return e.data
 	}
+	c.robotsMu.Lock()
+	defer c.robotsMu.Unlock()
+	c.mu.Lock()
+	e, ok = c.robots[key]
+	c.mu.Unlock()
+	if ok && e.round == round {
+		return e.data
+	}
+	data, _ := c.fetchRobots(ctx, u)
+	return data
+}
+
+// fetchRobots fetches and stores robots.txt for u's origin.
+func (c *Client) fetchRobots(ctx context.Context, u *url.URL) (*robotstxt.RobotsData, error) {
+	ru := u.ResolveReference(&url.URL{Path: "/robots.txt"})
+	data := disallowAll
+	resp, err := c.get(context.WithValue(ctx, skipRobots{}, true), ru, "text/plain", false, false, c.maxBytes)
+	if err == nil {
+		var perr error
+		data, perr = robotstxt.FromStatusAndBytes(resp.Status, resp.Body)
+		if perr != nil {
+			// An unparseable file is treated like a missing one.
+			data, _ = robotstxt.FromStatusAndBytes(http.StatusNotFound, nil)
+		}
+	}
+	c.mu.Lock()
+	c.robots[origin(u)] = robotsEntry{data: data, round: c.round}
+	c.mu.Unlock()
+	return data, err
+}
+
+func (c *Client) robotsAllow(ctx context.Context, u *url.URL) bool {
+	data := c.robotsFor(ctx, u)
 	p := u.EscapedPath()
 	if p == "" {
 		p = "/"
@@ -185,28 +244,21 @@ func (c *Client) robotsAllow(u *url.URL) bool {
 	if u.RawQuery != "" {
 		p += "?" + u.RawQuery
 	}
-	return g.Test(p)
+	return data.TestAgent(p, robotsAgent)
 }
 
-// LoadRobots fetches robots.txt for base and applies it to later requests,
-// including its Crawl-delay. It returns the Sitemap URLs listed in the file. A
-// missing robots.txt allows everything.
+// LoadRobots fetches robots.txt for the site's own origin, applies its
+// Crawl-delay, and returns the Sitemap URLs it lists. A missing robots.txt
+// allows everything. One that can't be fetched disallows everything, and
+// LoadRobots returns the error.
 func (c *Client) LoadRobots(ctx context.Context, base *url.URL) ([]string, error) {
-	u := base.ResolveReference(&url.URL{Path: "/robots.txt"})
-	resp, err := c.get(context.WithValue(ctx, skipRobots{}, true), u, "text/plain", false, false, c.maxBytes)
+	c.robotsMu.Lock()
+	data, err := c.fetchRobots(ctx, base)
+	c.robotsMu.Unlock()
 	if err != nil {
 		return nil, err
 	}
-	data, err := robotstxt.FromStatusAndBytes(resp.Status, resp.Body)
-	if err != nil {
-		// An unparseable file is treated like a missing one.
-		data, _ = robotstxt.FromStatusAndBytes(http.StatusNotFound, nil)
-	}
-	g := data.FindGroup(robotsAgent)
-	c.mu.Lock()
-	c.robots = g
-	c.mu.Unlock()
-	if g != nil && g.CrawlDelay > 0 {
+	if g := data.FindGroup(robotsAgent); g != nil && g.CrawlDelay > 0 {
 		c.limiter.SetLimit(min(rate.Every(g.CrawlDelay), c.rate))
 		c.limiter.SetBurst(1)
 	} else {
@@ -232,7 +284,7 @@ func (c *Client) get(ctx context.Context, u *url.URL, accept string, conditional
 	if err := c.checkURL(u); err != nil {
 		return nil, err
 	}
-	if checkRobots && !c.robotsAllow(u) {
+	if checkRobots && !c.robotsAllow(ctx, u) {
 		return nil, fmt.Errorf("%w: %s", ErrDisallowed, u)
 	}
 	if err := c.limiter.Wait(ctx); err != nil {

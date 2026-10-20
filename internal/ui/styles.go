@@ -7,7 +7,7 @@ import (
 )
 
 type styles struct {
-	title, dim, accent, selected, row, status, key, err lipgloss.Style
+	title, dim, accent, selected, key, err lipgloss.Style
 }
 
 func newStyles(dark bool) styles {
@@ -20,8 +20,6 @@ func newStyles(dark bool) styles {
 		dim:      lipgloss.NewStyle().Foreground(dim),
 		accent:   lipgloss.NewStyle().Foreground(accent),
 		selected: lipgloss.NewStyle().Background(accent).Foreground(selFg).Bold(true),
-		row:      lipgloss.NewStyle(),
-		status:   lipgloss.NewStyle().Foreground(dim),
 		key:      lipgloss.NewStyle().Foreground(accent).Bold(true),
 		err:      lipgloss.NewStyle().Foreground(lipgloss.Color("#e03131")),
 	}

@@ -106,3 +106,62 @@ func TestValidatorsPruned(t *testing.T) {
 		t.Error("validator for /a was dropped")
 	}
 }
+
+func TestRobotsUnreachableDisallowsAll(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) {
+		// Close the connection without answering.
+		hj, _ := w.(http.Hijacker)
+		conn, _, _ := hj.Hijack()
+		conn.Close()
+	})
+	mux.HandleFunc("/page", func(w http.ResponseWriter, r *http.Request) {
+		t.Error("fetched a page although robots.txt was unreachable")
+	})
+	srv, c := testServer(t, mux.ServeHTTP)
+	if _, err := c.LoadRobots(context.Background(), mustURL(t, srv.URL)); err == nil {
+		t.Error("LoadRobots: no error for an unreachable robots.txt")
+	}
+	if _, err := c.Get(context.Background(), mustURL(t, srv.URL+"/page"), "", false); !errors.Is(err, ErrDisallowed) {
+		t.Errorf("err = %v, want ErrDisallowed", err)
+	}
+}
+
+func TestRobotsPerHost(t *testing.T) {
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/robots.txt" {
+			w.Write([]byte("User-agent: *\nAllow: /\n"))
+		}
+	}))
+	defer site.Close()
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/robots.txt" {
+			w.Write([]byte("User-agent: sshr\nDisallow: /\n"))
+			return
+		}
+		t.Errorf("fetched %s on a host whose robots.txt disallows sshr", r.URL.Path)
+	}))
+	defer other.Close()
+
+	c := New(Options{Hosts: []string{mustURL(t, site.URL).Host, mustURL(t, other.URL).Host}, Rate: 1000, Burst: 100})
+	ctx := context.Background()
+	c.LoadRobots(ctx, mustURL(t, site.URL))
+	if _, err := c.Get(ctx, mustURL(t, other.URL+"/post"), "", false); !errors.Is(err, ErrDisallowed) {
+		t.Errorf("err = %v, want ErrDisallowed from the other host's robots.txt", err)
+	}
+}
+
+func TestRobots5xxDisallowsAll(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "down", http.StatusServiceUnavailable)
+	})
+	mux.HandleFunc("/page", func(w http.ResponseWriter, r *http.Request) {
+		t.Error("fetched a page although robots.txt answered 503")
+	})
+	srv, c := testServer(t, mux.ServeHTTP)
+	c.LoadRobots(context.Background(), mustURL(t, srv.URL))
+	if _, err := c.Get(context.Background(), mustURL(t, srv.URL+"/page"), "", false); !errors.Is(err, ErrDisallowed) {
+		t.Errorf("err = %v, want ErrDisallowed", err)
+	}
+}

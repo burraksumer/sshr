@@ -47,6 +47,7 @@ type Model struct {
 	visible        []*content.Entry
 
 	// reader
+	renders map[renderKey]render.Document
 	entry   *content.Entry
 	doc     render.Document
 	vp      viewport.Model
@@ -69,6 +70,17 @@ func New(store *content.Store) Model {
 	m.syncSite()
 	return m
 }
+
+// renderKey identifies a rendered entry. Resizing back and forth or
+// revisiting an entry reuses the render.
+type renderKey struct {
+	entry *content.Entry
+	width int
+	dark  bool
+}
+
+// maxRenders caps the per-session render cache.
+const maxRenders = 8
 
 type pollMsg struct{}
 
@@ -347,9 +359,20 @@ func (m *Model) renderEntry(top bool) {
 	m.vp.SetWidth(m.width)
 	m.vp.SetHeight(max(m.height-1, 1))
 
-	doc, err := render.Markdown(m.entry.Body, render.Options{Width: w, Dark: m.dark, BaseURL: m.entry.URL})
-	if err != nil {
-		doc = render.Document{Content: m.entry.Body}
+	key := renderKey{m.entry, w, m.dark}
+	doc, ok := m.renders[key]
+	if !ok {
+		var err error
+		doc, err = render.Markdown(m.entry.Body, render.Options{Width: w, Dark: m.dark, BaseURL: m.entry.URL})
+		if err != nil {
+			// The body is sanitized markdown, but render failed, so show it
+			// unstyled rather than nothing.
+			doc = render.Document{Content: m.entry.Body}
+		}
+		if m.renders == nil || len(m.renders) >= maxRenders {
+			m.renders = map[renderKey]render.Document{}
+		}
+		m.renders[key] = doc
 	}
 	m.doc = doc
 
@@ -512,6 +535,8 @@ func (m Model) viewReader() string {
 		left = m.status
 	}
 	right := m.st.dim.Render(fmt.Sprintf("%3.0f%%", m.vp.ScrollPercent()*100))
+	// The percentage always fits; the hints give way on narrow terminals.
+	left = ansi.Truncate(left, max(m.width-ansi.StringWidth(right)-3, 0), "…")
 	gap := max(m.width-ansi.StringWidth(left)-ansi.StringWidth(right)-2, 1)
 	return m.vp.View() + "\n " + left + strings.Repeat(" ", gap) + right
 }
