@@ -1,0 +1,4 @@
+/sshr
+/dist/
+.sshr/
+sshr.toml

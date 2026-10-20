@@ -1,0 +1,149 @@
+// Package config loads sshr.toml and applies environment overrides.
+package config
+
+import (
+	"errors"
+	"fmt"
+	"net/url"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/BurntSushi/toml"
+)
+
+// Config is the full sshr configuration. Only URL is required.
+type Config struct {
+	// URL is the site to serve.
+	URL string `toml:"url"`
+	// AllowedHosts are extra hosts sshr may fetch from, for sites that serve
+	// their feed or pages from another domain.
+	AllowedHosts []string `toml:"allowed_hosts"`
+	// Refresh is how often the site is re-read.
+	Refresh Duration `toml:"refresh"`
+	// MaxEntries caps how many posts and pages are kept.
+	MaxEntries int `toml:"max_entries"`
+
+	Listen         string   `toml:"listen"`
+	HostKey        string   `toml:"host_key"`
+	MaxSessions    int      `toml:"max_sessions"`
+	MaxPerIP       int      `toml:"max_per_ip"`
+	IdleTimeout    Duration `toml:"idle_timeout"`
+	MaxSession     Duration `toml:"max_session"`
+	ProxyProtocol  bool     `toml:"proxy_protocol"`
+	TrustedProxies []string `toml:"trusted_proxies"`
+
+	// LogFormat is "json" or "text".
+	LogFormat string `toml:"log_format"`
+}
+
+// Default returns the configuration used when a field is not set.
+func Default() Config {
+	return Config{
+		Refresh:     Duration(15 * time.Minute),
+		MaxEntries:  200,
+		Listen:      ":2222",
+		HostKey:     ".sshr/host_ed25519",
+		MaxSessions: 200,
+		MaxPerIP:    5,
+		IdleTimeout: Duration(15 * time.Minute),
+		MaxSession:  Duration(2 * time.Hour),
+		LogFormat:   "json",
+	}
+}
+
+// Load reads path (if it exists) over the defaults, then applies SSHR_*
+// environment variables. A missing file is not an error unless required.
+func Load(path string, required bool) (Config, error) {
+	cfg := Default()
+	if path != "" {
+		_, err := toml.DecodeFile(path, &cfg)
+		switch {
+		case errors.Is(err, os.ErrNotExist) && !required:
+		case err != nil:
+			return cfg, fmt.Errorf("%s: %w", path, err)
+		}
+	}
+	env := map[string]*string{
+		"SSHR_URL":        &cfg.URL,
+		"SSHR_LISTEN":     &cfg.Listen,
+		"SSHR_HOST_KEY":   &cfg.HostKey,
+		"SSHR_LOG_FORMAT": &cfg.LogFormat,
+	}
+	for k, p := range env {
+		if v := os.Getenv(k); v != "" {
+			*p = v
+		}
+	}
+	return cfg, nil
+}
+
+// SiteURL validates URL and returns it parsed.
+func (c Config) SiteURL() (*url.URL, error) {
+	return ParseSiteURL(c.URL)
+}
+
+// ParseSiteURL accepts "example.com" or a full http(s) URL.
+func ParseSiteURL(raw string) (*url.URL, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, errors.New("no site URL set (url in sshr.toml, SSHR_URL, or --url)")
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "https://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("site URL must be http or https, got %q", u.Scheme)
+	}
+	if u.Hostname() == "" {
+		return nil, fmt.Errorf("site URL %q has no host", raw)
+	}
+	if u.Path == "" {
+		u.Path = "/"
+	}
+	return u, nil
+}
+
+// Hosts returns every host sshr may fetch from: the site's host, its www or
+// bare variant, and AllowedHosts.
+func (c Config) Hosts(site *url.URL) []string {
+	h := strings.ToLower(site.Hostname())
+	hosts := []string{h}
+	if bare, ok := strings.CutPrefix(h, "www."); ok {
+		hosts = append(hosts, bare)
+	} else if strings.Contains(h, ".") && hasLetters(h) {
+		hosts = append(hosts, "www."+h)
+	}
+	for _, a := range c.AllowedHosts {
+		hosts = append(hosts, strings.ToLower(strings.TrimSpace(a)))
+	}
+	return hosts
+}
+
+// hasLetters reports whether h is a DNS name rather than an IP address.
+func hasLetters(h string) bool {
+	for _, r := range h {
+		if (r < '0' || r > '9') && r != '.' && r != ':' {
+			return true
+		}
+	}
+	return false
+}
+
+// Duration is a time.Duration that reads from TOML strings like "15m".
+type Duration time.Duration
+
+func (d *Duration) UnmarshalText(b []byte) error {
+	v, err := time.ParseDuration(string(b))
+	if err != nil {
+		return err
+	}
+	*d = Duration(v)
+	return nil
+}
+
+func (d Duration) D() time.Duration { return time.Duration(d) }
