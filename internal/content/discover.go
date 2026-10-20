@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"path"
@@ -120,7 +122,7 @@ type Discoverer struct {
 // and publish is set, Discover calls publish with a partial snapshot as soon
 // as the entries that came with full content are ready, before fetching
 // individual pages.
-func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Site)) (*Site, error) {
+func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Site)) (site *Site, err error) {
 	log := d.Log
 	if log == nil {
 		log = slog.Default()
@@ -131,6 +133,13 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 	}
 	d.Client.StartRound()
 	defer d.Client.EndRound()
+	// The store keeps the previous snapshot when this fails, so validators
+	// for responses it never got have to go.
+	defer func() {
+		if err != nil {
+			d.Client.Discard()
+		}
+	}()
 	scope := d.scope()
 
 	sitemaps, err := d.Client.LoadRobots(ctx, d.Base)
@@ -142,7 +151,7 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 		}
 	}
 
-	site := &Site{URL: d.Base.String(), Title: d.Base.Hostname(), robotsSitemaps: sitemaps}
+	site = &Site{URL: d.Base.String(), Title: d.Base.Hostname(), robotsSitemaps: sitemaps}
 	var feedLinks []feedLink
 	// The homepage is asked for conditionally, and its head is reused when
 	// it hasn't changed.
@@ -345,7 +354,7 @@ func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []feedLink,
 		res, err := d.Client.GetLarge(ctx, u, acceptFeed, conditional)
 		if err != nil {
 			log.Debug("feed", "url", raw, "err", err)
-			if prev != nil && raw == prev.feedURL && !permanent(err) {
+			if prev != nil && raw == prev.feedURL && passing(err) {
 				prevFailed = true
 			}
 			continue
@@ -379,24 +388,20 @@ func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []feedLink,
 			if e == nil {
 				continue
 			}
-			// Feeds sometimes list a post twice, or under both www and bare
-			// hosts. Keep the first.
-			if u, err := url.Parse(e.URL); e.URL != "" && err == nil {
-				if key := normalize(u); seenItem[key] {
-					continue
-				} else {
-					seenItem[key] = true
-				}
-			}
 			// A site-wide feed found from a /blog site only counts for
 			// its /blog posts. Items without a URL can't be placed, so a
-			// scoped site leaves them out.
+			// scoped site leaves them out. Feeds sometimes list a post
+			// twice, or under both www and bare hosts, so the first wins.
 			if e.URL == "" {
 				if scope != "/" {
 					continue
 				}
-			} else if u, err := url.Parse(e.URL); err != nil || !inScope(u, scope) {
-				continue
+			} else {
+				u, err := url.Parse(e.URL)
+				if err != nil || !inScope(u, scope) || seenItem[normalize(u)] {
+					continue
+				}
+				seenItem[normalize(u)] = true
 			}
 			entries = append(entries, e)
 		}
@@ -450,14 +455,24 @@ func applyFeedMeta(site *Site, title, description string) {
 	}
 }
 
-// permanent reports whether a fetch error means the URL is off limits, as
-// opposed to failing for a moment. A robots.txt that can't be fetched right
-// now counts as a passing failure.
-func permanent(err error) bool {
-	if errors.Is(err, fetch.ErrRobotsUnavailable) {
-		return false
+// passing reports whether a fetch error is the kind that goes away, like a
+// timeout, a dropped connection or a robots.txt that can't be fetched right
+// now. Others, like a refusal, an oversized body or a redirect loop, come
+// back every time, so old copies aren't kept over them.
+func passing(err error) bool {
+	var op *net.OpError
+	var ne net.Error
+	switch {
+	case errors.Is(err, fetch.ErrRobotsUnavailable):
+		return true
+	case errors.As(err, &op):
+		return true
+	case errors.As(err, &ne) && ne.Timeout():
+		return true
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, io.EOF):
+		return true
 	}
-	return errors.Is(err, fetch.ErrDisallowed) || errors.Is(err, fetch.ErrNotAllowed)
+	return false
 }
 
 // transient reports whether an HTTP status is worth keeping old data over.
@@ -641,7 +656,7 @@ func keepPrevious(res *fetch.Response, err error, hasOld bool) bool {
 	case !hasOld:
 		return false
 	case err != nil:
-		return !permanent(err)
+		return passing(err)
 	}
 	return res.NotModified || transient(res.Status)
 }
@@ -652,6 +667,7 @@ func (d *Discoverer) readPage(e *Entry, res *fetch.Response) error {
 	switch res.ContentType {
 	case "text/markdown", "text/x-markdown", "text/plain":
 		body := sanitize.Text(string(res.Body))
+		e.base = sanitize.URL(res.URL.String())
 		title, date, body := frontMatter(body)
 		if e.Title == "" {
 			e.Title = title
@@ -679,6 +695,7 @@ func (d *Discoverer) readPage(e *Entry, res *fetch.Response) error {
 	if article.Node == nil {
 		return errors.New("no article content")
 	}
+	e.base = sanitize.URL(res.URL.String())
 	md, err := htmltomarkdown.ConvertNode(article.Node, converter.WithDomain(res.URL.String()))
 	if err != nil {
 		return err
@@ -703,7 +720,7 @@ func (d *Discoverer) readPage(e *Entry, res *fetch.Response) error {
 
 // reuse copies old's page content into e, keeping the feed's own fields.
 func reuse(e, old *Entry) {
-	e.Body, e.fetchedAt, e.stale = old.Body, old.fetchedAt, old.stale
+	e.Body, e.fetchedAt, e.stale, e.base = old.Body, old.fetchedAt, old.stale, old.base
 	// Feed entries are posts whatever the page looked like last time.
 	if !e.fromFeed {
 		e.Kind = old.Kind
@@ -749,8 +766,9 @@ func (d *Discoverer) loadSitemaps(ctx context.Context, roots []string, prev *Sit
 			queue = append(queue, u.String())
 		}
 	}
-	if len(queue) == 0 {
-		queue = d.atScopes(scope, "sitemap.xml")
+	// Gzipped sitemaps are skipped, so a list of only those counts as none.
+	if !slices.ContainsFunc(queue, func(q string) bool { return !strings.HasSuffix(q, ".gz") }) {
+		queue = append(queue, d.atScopes(scope, "sitemap.xml")...)
 	}
 	visited := map[string]bool{}
 	cache := map[string]cachedSitemap{}
@@ -1105,8 +1123,9 @@ func parseDate(s string) time.Time {
 	s = strings.TrimSpace(s)
 	for _, layout := range []string{
 		time.RFC3339, "2006-01-02T15:04Z07:00", "2006-01-02",
-		// Jekyll and Hugo front matter.
+		// Jekyll and Hugo front matter, and dates without a zone.
 		"2006-01-02 15:04:05 -0700", "2006-01-02 15:04:05", "2006-01-02 15:04",
+		"2006-01-02T15:04:05", "2006-01-02T15:04",
 		time.RFC1123Z, time.RFC1123,
 	} {
 		if t, err := time.Parse(layout, s); err == nil {

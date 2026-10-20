@@ -38,6 +38,12 @@ type Options struct {
 	BaseURL string
 }
 
+// gm parses markdown. Its parser is safe to share.
+var gm = goldmark.New(
+	goldmark.WithExtensions(extension.GFM, extension.DefinitionList),
+	goldmark.WithParserOptions(parser.WithAutoHeadingID()),
+)
+
 // Markdown renders md for a terminal of the given width.
 func Markdown(md string, opts Options) (Document, error) {
 	width := max(opts.Width, 20)
@@ -51,10 +57,6 @@ func Markdown(md string, opts Options) (Document, error) {
 		margin = int(*style.Document.Margin)
 	}
 
-	gm := goldmark.New(
-		goldmark.WithExtensions(extension.GFM, extension.DefinitionList),
-		goldmark.WithParserOptions(parser.WithAutoHeadingID()),
-	)
 	source := []byte(md)
 	doc := gm.Parser().Parse(text.NewReader(source))
 	// Number links first, so a strikethrough that cleanTree flattens keeps
@@ -89,16 +91,42 @@ func numberLinks(doc ast.Node, source []byte, base string) ([]byte, []Link) {
 	var links []Link
 	byURL := map[string]int{}
 	var targets []*ast.Link
+	var autos []*ast.AutoLink
 	_ = ast.Walk(doc, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
 		if !entering {
 			return ast.WalkContinue, nil
 		}
-		if l, ok := n.(*ast.Link); ok {
-			targets = append(targets, l)
+		switch n := n.(type) {
+		case *ast.Link:
+			targets = append(targets, n)
 			return ast.WalkSkipChildren, nil
+		case *ast.AutoLink:
+			if n.AutoLinkType == ast.AutoLinkURL {
+				autos = append(autos, n)
+			}
 		}
 		return ast.WalkContinue, nil
 	})
+	number := func(dest string) int {
+		num, ok := byURL[dest]
+		if !ok {
+			num = len(links) + 1
+			byURL[dest] = num
+			links = append(links, Link{N: num, URL: dest})
+		}
+		return num
+	}
+	// Bare URLs show their address already. They get a number too, so they
+	// can be followed like other links.
+	for _, a := range autos {
+		dest := resolve(base, string(a.URL(source)))
+		if sameDocument(dest, base) {
+			continue
+		}
+		var t *ast.Text
+		source, t = appendText(source, fmt.Sprintf(" [%d]", number(dest)))
+		a.Parent().InsertAfter(a.Parent(), a, t)
+	}
 	for _, l := range targets {
 		dest := linkDestination(l.Destination)
 		if dest == "" || strings.HasPrefix(dest, "#") {
@@ -111,12 +139,7 @@ func numberLinks(doc ast.Node, source []byte, base string) ([]byte, []Link) {
 			l.Destination = []byte("#")
 			continue
 		}
-		num, ok := byURL[dest]
-		if !ok {
-			num = len(links) + 1
-			byURL[dest] = num
-			links = append(links, Link{N: num, URL: dest})
-		}
+		num := number(dest)
 		// An anchor-only destination makes glamour render the text without
 		// printing the URL after it.
 		l.Destination = []byte("#")

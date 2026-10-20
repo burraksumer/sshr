@@ -120,3 +120,11 @@ func TestAllowedHostsNotLowercasedFirst(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateRejectsUnconvertibleHost(t *testing.T) {
+	c := Default()
+	c.URL = "https://ex‍ample.com"
+	if err := c.Validate(); err == nil {
+		t.Error("host that IDNA rejects passed validation")
+	}
+}

@@ -323,7 +323,9 @@ func sessionChannel(srv *ssh.Server, conn *gossh.ServerConn, newChan gossh.NewCh
 	ssh.DefaultSessionHandler(srv, conn, limitedChannel{newChan}, ctx)
 }
 
-// limitedChannel drops env requests past maxEnv or larger than maxEnvBytes.
+// limitedChannel drops env requests past maxEnv or larger than maxEnvBytes,
+// and refuses agent forwarding, which the library would otherwise
+// acknowledge.
 type limitedChannel struct{ gossh.NewChannel }
 
 func (c limitedChannel) Accept() (gossh.Channel, <-chan *gossh.Request, error) {
@@ -336,6 +338,12 @@ func (c limitedChannel) Accept() (gossh.Channel, <-chan *gossh.Request, error) {
 		defer close(out)
 		env := 0
 		for req := range reqs {
+			if req.Type == "auth-agent-req@openssh.com" {
+				if req.WantReply {
+					_ = req.Reply(false, nil)
+				}
+				continue
+			}
 			if req.Type == "env" {
 				env++
 				if env > maxEnv || len(req.Payload) > maxEnvBytes {

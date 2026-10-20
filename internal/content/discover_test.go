@@ -2,7 +2,9 @@ package content
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -1222,5 +1224,59 @@ func TestGarbageFeedExpires(t *testing.T) {
 	}
 	if site.Lookup(srv.URL+"/p") != nil {
 		t.Error("posts from an unreadable feed kept forever")
+	}
+}
+
+// An error that comes back every time, like an oversized page, doesn't keep
+// the old copy. A timeout or dropped connection does.
+func TestPassing(t *testing.T) {
+	if passing(errors.New("fetch: \"x\" is larger than 5 bytes")) {
+		t.Error("oversized page counted as passing")
+	}
+	if !passing(fmt.Errorf("x: %w", fetch.ErrRobotsUnavailable)) {
+		t.Error("robots outage not passing")
+	}
+	if !passing(&net.OpError{Op: "dial", Err: errors.New("refused")}) {
+		t.Error("connection error not passing")
+	}
+}
+
+// A refresh that fails drops the validators it stored, so the next one
+// doesn't get 304s for content the store never received.
+func TestFailedRefreshDiscardsValidators(t *testing.T) {
+	var round atomic.Int32
+	var conditional atomic.Int32
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("/feed.json", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("If-None-Match") != "" {
+			conditional.Add(1)
+		}
+		w.Header().Set("ETag", fmt.Sprintf(`"%d"`, round.Load()))
+		w.Header().Set("Content-Type", "application/feed+json")
+		item := `{"id":"1","url":"` + srv.URL + `/p","title":"P","content_text":"body"}`
+		if round.Load() == 1 {
+			item = `{"id":"1","url":"` + srv.URL + `/p","title":"P","summary":"s"}`
+		}
+		w.Write([]byte(`{"version":"https://jsonfeed.org/version/1.1","items":[` + item + `]}`))
+	})
+	mux.HandleFunc("/p", func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) })
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+	base, _ := url.Parse(srv.URL + "/")
+	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Host}, Rate: 1000, Burst: 100}), Base: base}
+	site, err := d.Discover(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	round.Store(1) // the feed changes and the refresh fails
+	if _, err := d.Discover(context.Background(), site, nil); err == nil {
+		t.Fatal("expected the refresh to fail")
+	}
+	round.Store(2)
+	conditional.Store(0)
+	d.Discover(context.Background(), site, nil)
+	if conditional.Load() != 0 {
+		t.Error("validators from the failed refresh were sent")
 	}
 }

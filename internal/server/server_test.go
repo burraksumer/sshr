@@ -158,3 +158,15 @@ func TestDeadlineAfterRefusedSession(t *testing.T) {
 		t.Error("connection still open after the deadline")
 	}
 }
+
+func TestAgentForwardingRefused(t *testing.T) {
+	c := dial(t, startServer(t))
+	s, err := c.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ok, err := s.SendRequest("auth-agent-req@openssh.com", true, nil)
+	if err != nil || ok {
+		t.Errorf("agent forwarding request: ok=%v err=%v, want refused", ok, err)
+	}
+}

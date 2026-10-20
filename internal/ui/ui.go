@@ -413,7 +413,7 @@ func (m *Model) renderEntry(top bool) {
 	m.vp.SetWidth(m.width)
 	m.vp.SetHeight(max(m.height-1, 1))
 
-	doc, err := render.Cached(m.entry.RenderID(), m.entry.Body, render.Options{Width: w, Dark: m.dark, BaseURL: m.entry.URL})
+	doc, err := render.Cached(m.entry.RenderID(), m.entry.Body, render.Options{Width: w, Dark: m.dark, BaseURL: m.entry.BaseURL()})
 	if err != nil {
 		// The body is sanitized markdown, but render failed, so show it
 		// unstyled rather than nothing.

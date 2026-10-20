@@ -34,12 +34,24 @@ type Entry struct {
 	// stale counts refreshes in a row that kept this copy because the page
 	// couldn't be read.
 	stale int
+	// base is the URL the page was read from after redirects, which its
+	// relative links resolve against.
+	base string
 }
 
 // renderID identifies an entry's content across refreshes.
 type renderID struct {
 	url  string
 	hash uint64
+}
+
+// BaseURL is what the entry's links resolve against: the page's final URL
+// after redirects, or the entry URL.
+func (e *Entry) BaseURL() string {
+	if e.base != "" {
+		return e.base
+	}
+	return e.URL
 }
 
 // RenderID is a comparable key for caching renders of the entry. It stays

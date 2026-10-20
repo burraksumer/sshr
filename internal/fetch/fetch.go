@@ -78,7 +78,8 @@ type Response struct {
 
 type validators struct {
 	etag, lastModified string
-	round              int
+	round              int // last round they were used
+	stored             int // round they were stored from a 200
 }
 
 // Client fetches documents from a fixed set of hosts.
@@ -209,6 +210,19 @@ func (c *Client) touch(key string) {
 	if v, ok := c.validators[key]; ok {
 		v.round = c.round
 		c.validators[key] = v
+	}
+}
+
+// Discard drops the validators stored this round. A refresh that fails
+// calls it, because its new responses never reached a snapshot, and a
+// later 304 must not confirm content the caller doesn't have.
+func (c *Client) Discard() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for k, v := range c.validators {
+		if v.stored == c.round {
+			delete(c.validators, k)
+		}
 	}
 }
 
@@ -656,7 +670,7 @@ func (c *Client) do(ctx context.Context, u *url.URL, accept string, conditional 
 	if res.StatusCode == http.StatusOK {
 		v := validators{etag: res.Header.Get("ETag"), lastModified: res.Header.Get("Last-Modified")}
 		c.mu.Lock()
-		v.round = c.round
+		v.round, v.stored = c.round, c.round
 		if v.etag != "" || v.lastModified != "" {
 			c.validators[key] = v
 		} else {

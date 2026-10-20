@@ -288,3 +288,16 @@ func TestCachedPanicReleases(t *testing.T) {
 		}
 	}
 }
+
+func TestBareURLsNumbered(t *testing.T) {
+	doc, err := Markdown("See https://example.com/other for more.", Options{Width: 80})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Links) != 1 || doc.Links[0].URL != "https://example.com/other" {
+		t.Errorf("links = %+v", doc.Links)
+	}
+	if !strings.Contains(ansi.Strip(doc.Content), "https://example.com/other [1]") {
+		t.Errorf("bare URL not numbered:\n%s", ansi.Strip(doc.Content))
+	}
+}
