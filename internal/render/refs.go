@@ -116,9 +116,15 @@ func cleanHTMLSegment(source []byte, seg text.Segment) ([]byte, text.Segment) {
 }
 
 // hyperlinkTargets lists the URLs glamour may legitimately wrap in OSC 8
-// hyperlinks: autolinks, including the numbered link list, and images.
+// hyperlinks, which are autolinks, including the numbered link list, and
+// images. Only Clickable schemes count.
 func hyperlinkTargets(doc ast.Node, source []byte) map[string]bool {
 	targets := map[string]bool{}
+	add := func(u string) {
+		if Clickable(u) {
+			targets[u] = true
+		}
+	}
 	_ = ast.Walk(doc, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
 		if !entering {
 			return ast.WalkContinue, nil
@@ -126,18 +132,18 @@ func hyperlinkTargets(doc ast.Node, source []byte) map[string]bool {
 		switch n := n.(type) {
 		case *ast.AutoLink:
 			u := string(n.URL(source))
-			targets[u] = true
-			targets["mailto:"+u] = true
+			add(u)
+			add("mailto:" + u)
 		case *ast.Image:
-			targets[string(n.Destination)] = true
+			add(string(n.Destination))
 		}
 		return ast.WalkContinue, nil
 	})
 	return targets
 }
 
-// filterOutput is the last line of defence: it keeps only the escape
-// sequences glamour itself produces, SGR styling and OSC 8 hyperlinks to
+// filterOutput is the last line of defence. It keeps the escape sequences
+// glamour itself produces, which are SGR styling and OSC 8 hyperlinks to
 // targets, and drops every other escape sequence and control character.
 func filterOutput(s string, targets map[string]bool) string {
 	var b strings.Builder
@@ -179,12 +185,16 @@ func filterOutput(s string, targets map[string]bool) string {
 				i = end + term
 				continue
 			default:
-				i += 2
+				// Drop ESC and the whole character after it, so a
+				// multibyte character can't leave stray bytes behind.
+				_, size := utf8.DecodeRuneInString(s[i+1:])
+				i += 1 + size
 				continue
 			}
 		}
 		r, size := utf8.DecodeRuneInString(s[i:])
-		if !sanitize.Dropped(r) {
+		// Invalid bytes are dropped too; a lone 0x9b is an 8-bit CSI.
+		if !sanitize.Dropped(r) && (r != utf8.RuneError || size > 1) {
 			b.WriteString(s[i : i+size])
 		}
 		i += size

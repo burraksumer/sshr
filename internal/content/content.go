@@ -46,7 +46,11 @@ type Site struct {
 	// because their page couldn't be fetched, so a refresh that gets 304
 	// for the feed can retry them.
 	feedEntries []*Entry
-	byURL       map[string]*Entry
+	// sitemaps holds parsed sitemaps by URL for conditional requests.
+	sitemaps map[string]cachedSitemap
+	// probeAge counts refreshes since the common feed paths were probed.
+	probeAge int
+	byURL    map[string]*Entry
 }
 
 // Lookup returns the entry for rawURL, or nil if the site has none.
@@ -67,9 +71,9 @@ func (s *Site) index() {
 	}
 }
 
-// normalize returns a comparison key for u: https, lowercase host without
-// "www.", no fragment, no trailing slash. sshr treats a site's www and bare
-// hosts as the same site.
+// normalize returns a comparison key for u. It uses https and a lowercase
+// host without "www.", and drops the fragment and any trailing slash. sshr
+// treats a site's www and bare hosts as the same site.
 func normalize(u *url.URL) string {
 	c := *u
 	c.Scheme = strings.ToLower(c.Scheme)

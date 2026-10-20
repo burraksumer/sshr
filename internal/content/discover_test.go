@@ -2,6 +2,7 @@ package content
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -401,5 +402,59 @@ func TestNormalizeFoldsWWW(t *testing.T) {
 	b, _ := url.Parse("http://EXAMPLE.com/post#top")
 	if normalize(a) != normalize(b) {
 		t.Errorf("%q != %q", normalize(a), normalize(b))
+	}
+}
+
+func TestReadablePath(t *testing.T) {
+	for p, want := range map[string]bool{
+		"/posts/go-1.22-released": true, "/blog/node.js-tips": true, "/about": true,
+		"/index.html": true, "/a.php": true, "/logo.png": false, "/paper.PDF": false, "/feed.xml": false,
+	} {
+		if got := readablePath(p); got != want {
+			t.Errorf("readablePath(%q) = %v, want %v", p, got, want)
+		}
+	}
+	if got := titleFromURL("https://x.example/posts/go-1.22-released"); got != "Go 1.22 released" {
+		t.Errorf("titleFromURL = %q", got)
+	}
+}
+
+// Feeds that list oldest first keep their newest posts when cut, and the
+// advertised type decides which feed wins.
+func TestFeedOrderAndType(t *testing.T) {
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("/{$}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<html><head>
+<link rel="alternate" type="application/rss+xml" href="/rss">
+<link rel="alternate" type="application/json" href="/feed/json/"></head></html>`))
+	})
+	mux.HandleFunc("/rss", func(w http.ResponseWriter, r *http.Request) {
+		t.Error("RSS fetched although a JSON Feed was advertised")
+	})
+	mux.HandleFunc("/feed/json/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		var items []string
+		for i := 1; i <= 5; i++ {
+			items = append(items, fmt.Sprintf(`{"id":"%d","url":"%s/p%d","title":"P%d","content_text":"b","date_published":"2024-01-0%dT00:00:00Z"}`, i, srv.URL, i, i, i))
+		}
+		w.Write([]byte(`{"version":"https://jsonfeed.org/version/1.1","title":"T","items":[` + strings.Join(items, ",") + `]}`))
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+
+	base, _ := url.Parse(srv.URL + "/")
+	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Host}, Rate: 1000, Burst: 100}), Base: base, MaxEntries: 2}
+	site, err := d.Discover(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var titles []string
+	for _, e := range site.Entries {
+		titles = append(titles, e.Title)
+	}
+	if strings.Join(titles, ",") != "P5,P4" {
+		t.Errorf("entries = %v, want the newest two", titles)
 	}
 }

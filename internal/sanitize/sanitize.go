@@ -4,9 +4,9 @@ package sanitize
 
 import "strings"
 
-// Dropped reports whether r is a character Text removes: C0 controls
-// (including ESC and CR) other than newline and tab, DEL, C1 controls, Unicode
-// bidi overrides and the byte order mark.
+// Dropped reports whether r is a character Text removes. That covers C0
+// controls other than newline and tab, so ESC and CR go, plus DEL, C1
+// controls, Unicode bidi overrides and the byte order mark.
 func Dropped(r rune) bool {
 	switch {
 	case r == '\n' || r == '\t':

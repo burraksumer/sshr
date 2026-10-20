@@ -132,3 +132,44 @@ func TestTableLinksNumbered(t *testing.T) {
 		t.Errorf("table link not numbered [2]:\n%s", plain)
 	}
 }
+
+func TestLinkDestinationsDecoded(t *testing.T) {
+	doc, err := Markdown(`[a](/posts/a\_b) and [b](/s?x=1&amp;y=2) and [c](/&#27;evil)`, Options{Width: 80, BaseURL: "https://site.example/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"https://site.example/posts/a_b", "https://site.example/s?x=1&y=2", "https://site.example/evil"}
+	for i, l := range doc.Links {
+		if i >= len(want) || l.URL != want[i] {
+			t.Errorf("links = %+v, want %q", doc.Links, want)
+			break
+		}
+	}
+}
+
+func TestOnlyWebSchemesClickable(t *testing.T) {
+	md := "<file:///etc/passwd> <vscode://x/y> ![i](javascript:alert(1)) [d](ms-msdt:/id) <https://ok.example> <me@example.com>"
+	doc, err := Markdown(md, Options{Width: 120})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"\x1b]8;id=[0-9]+;file:", "vscode:", "javascript:", "ms-msdt:"} {
+		if regexp.MustCompile("\x1b]8;[^\x07]*" + bad).MatchString(doc.Content) {
+			t.Errorf("clickable %s link in output", bad)
+		}
+	}
+	for _, good := range []string{"https://ok.example", "mailto:me@example.com"} {
+		if !strings.Contains(doc.Content, ";"+good+"\x07") {
+			t.Errorf("%s is not clickable", good)
+		}
+	}
+	if !strings.Contains(ansi.Strip(doc.Content), "file:///etc/passwd") {
+		t.Error("non-web link should still be shown as text")
+	}
+}
+
+func TestFilterDropsStrayBytes(t *testing.T) {
+	if got := filterOutput("a\x1b\xc2\x9b2Jb\x9bc", nil); got != "a2Jbc" {
+		t.Errorf("filterOutput = %q", got)
+	}
+}

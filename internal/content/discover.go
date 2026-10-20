@@ -43,6 +43,10 @@ var fallbackFeeds = []string{"feed.json", "feed.xml", "atom.xml", "rss.xml", "in
 // configured otherwise.
 const DefaultMaxEntries = 200
 
+// reprobeEvery is how many refreshes pass between probes of the common feed
+// paths on a site that has no feed, about six hours at the default interval.
+const reprobeEvery = 24
+
 // scope is the directory the site lives in: "/" for a whole domain, or
 // "/blog/" when the site URL is example.com/blog.
 func (d *Discoverer) scope() string {
@@ -100,7 +104,7 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 	}
 
 	site := &Site{URL: d.Base.String(), Title: d.Base.Hostname()}
-	var feedLinks []string
+	var feedLinks []feedLink
 	if res, err := d.Client.Get(ctx, d.Base, acceptHTML, false); err != nil {
 		log.Warn("homepage", "err", err)
 	} else if res.Status == 200 {
@@ -110,8 +114,8 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 		}
 		site.Description = meta.description
 		for _, f := range meta.feeds {
-			if u, err := res.URL.Parse(f); err == nil {
-				feedLinks = append(feedLinks, u.String())
+			if u, err := res.URL.Parse(f.href); err == nil {
+				feedLinks = append(feedLinks, feedLink{href: u.String(), typ: f.typ})
 			}
 		}
 	}
@@ -119,6 +123,11 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 	// Feeds give posts with dates and, often, full content.
 	entries, feedURL := d.loadFeed(ctx, site, feedLinks, prev, log)
 	site.feedURL = feedURL
+	// Some feeds list oldest first. Keep the newest posts when cutting.
+	sort.SliceStable(entries, func(i, j int) bool {
+		a, b := entries[i].Date, entries[j].Date
+		return !a.IsZero() && (b.IsZero() || a.After(b))
+	})
 	if len(entries) > maxEntries {
 		entries = entries[:maxEntries]
 	}
@@ -137,7 +146,9 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 		}
 	}
 	if room := maxEntries - len(entries); room > 0 {
-		for _, p := range d.loadSitemaps(ctx, sitemaps, log) {
+		pages, cache := d.loadSitemaps(ctx, sitemaps, prev, log)
+		site.sitemaps = cache
+		for _, p := range pages {
 			if room == 0 {
 				break
 			}
@@ -209,16 +220,22 @@ func finish(site *Site, kept []*Entry) *Site {
 
 // loadFeed tries feed candidates in order and returns the entries of the first
 // one that parses with at least one item.
-func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []string, prev *Site, log *slog.Logger) ([]*Entry, string) {
+func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []feedLink, prev *Site, log *slog.Logger) ([]*Entry, string) {
 	// Advertised feeds first, then the common paths, in case the advertised
 	// ones are broken.
 	candidates := sortFeeds(links)
-	for _, p := range fallbackFeeds {
-		for _, c := range d.atScopes(p) {
-			if !slices.Contains(candidates, c) {
-				candidates = append(candidates, c)
+	// A site that had no feed last time isn't probed at the common paths on
+	// every refresh, only every reprobeEvery refreshes.
+	if prev == nil || prev.feedURL != "" || prev.probeAge >= reprobeEvery {
+		for _, p := range fallbackFeeds {
+			for _, c := range d.atScopes(p) {
+				if !slices.Contains(candidates, c) {
+					candidates = append(candidates, c)
+				}
 			}
 		}
+	} else {
+		site.probeAge = prev.probeAge + 1
 	}
 	parser := gofeed.NewParser()
 	for _, raw := range candidates {
@@ -453,7 +470,7 @@ type sitemapDoc struct {
 
 // loadSitemaps reads the given sitemaps, following sitemap indexes, and
 // returns page URLs newest first.
-func (d *Discoverer) loadSitemaps(ctx context.Context, roots []string, log *slog.Logger) []sitemapURL {
+func (d *Discoverer) loadSitemaps(ctx context.Context, roots []string, prev *Site, log *slog.Logger) ([]sitemapURL, map[string]cachedSitemap) {
 	const maxFiles, maxURLs = 10, 2000
 	// robots.txt Sitemap lines can be relative or broken (an unrendered
 	// template, say). Keep the ones that resolve to an allowed URL.
@@ -467,6 +484,7 @@ func (d *Discoverer) loadSitemaps(ctx context.Context, roots []string, log *slog
 		queue = d.atScopes("sitemap.xml")
 	}
 	visited := map[string]bool{}
+	cache := map[string]cachedSitemap{}
 	var out []sitemapURL
 	for len(queue) > 0 && len(visited) < maxFiles && len(out) < maxURLs {
 		raw := queue[0]
@@ -479,24 +497,36 @@ func (d *Discoverer) loadSitemaps(ctx context.Context, roots []string, log *slog
 		if err != nil {
 			continue
 		}
-		res, err := d.Client.Get(ctx, u, acceptXML, false)
-		if err != nil || res.Status != 200 {
-			if err != nil {
-				log.Debug("sitemap", "url", raw, "err", err)
+		var old cachedSitemap
+		var hasOld bool
+		if prev != nil {
+			old, hasOld = prev.sitemaps[raw]
+		}
+		res, err := d.Client.Get(ctx, u, acceptXML, hasOld)
+		var c cachedSitemap
+		switch {
+		case err != nil:
+			log.Debug("sitemap", "url", raw, "err", err)
+			continue
+		case res.NotModified:
+			c = old
+		case res.Status != 200:
+			continue
+		default:
+			c.base = res.URL
+			if err := xml.Unmarshal(res.Body, &c.doc); err != nil {
+				continue
 			}
-			continue
 		}
-		var doc sitemapDoc
-		if err := xml.Unmarshal(res.Body, &doc); err != nil {
-			continue
-		}
+		cache[raw] = c
+		doc := c.doc
 		for _, s := range doc.Sitemaps {
-			if child, err := res.URL.Parse(strings.TrimSpace(s.Loc)); err == nil && d.Client.Allowed(ctx, child) {
+			if child, err := c.base.Parse(strings.TrimSpace(s.Loc)); err == nil && d.Client.Allowed(ctx, child) {
 				queue = append(queue, child.String())
 			}
 		}
 		for _, x := range doc.URLs {
-			loc, err := res.URL.Parse(strings.TrimSpace(x.Loc))
+			loc, err := c.base.Parse(strings.TrimSpace(x.Loc))
 			if err != nil {
 				continue
 			}
@@ -504,12 +534,23 @@ func (d *Discoverer) loadSitemaps(ctx context.Context, roots []string, log *slog
 		}
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].lastmod.After(out[j].lastmod) })
-	return out
+	return out, cache
+}
+
+// cachedSitemap is a parsed sitemap kept for conditional requests.
+type cachedSitemap struct {
+	base *url.URL
+	doc  sitemapDoc
 }
 
 type headMeta struct {
 	title, description string
-	feeds              []string
+	feeds              []feedLink
+}
+
+// feedLink is a feed advertised in a page's head.
+type feedLink struct {
+	href, typ string
 }
 
 // parseHead reads <title>, the description and feed links from an HTML head.
@@ -558,7 +599,7 @@ func parseHead(body []byte) headMeta {
 			case "link":
 				rels := strings.Fields(strings.ToLower(attrs["rel"]))
 				if slices.Contains(rels, "alternate") && isFeedType(attrs["type"]) && attrs["href"] != "" {
-					m.feeds = append(m.feeds, attrs["href"])
+					m.feeds = append(m.feeds, feedLink{href: attrs["href"], typ: strings.ToLower(strings.TrimSpace(attrs["type"]))})
 				}
 			}
 		}
@@ -582,18 +623,22 @@ func isFeedType(t string) bool {
 
 // sortFeeds orders feed links JSON Feed first, then Atom, then RSS. JSON Feed
 // and Atom are more likely to carry full content.
-func sortFeeds(links []string) []string {
-	rank := func(s string) int {
-		switch {
-		case strings.HasSuffix(s, ".json"):
+func sortFeeds(links []feedLink) []string {
+	rank := func(t string) int {
+		switch t {
+		case "application/feed+json", "application/json":
 			return 0
-		case strings.Contains(s, "atom"):
+		case "application/atom+xml":
 			return 1
 		}
 		return 2
 	}
-	out := slices.Clone(links)
-	sort.SliceStable(out, func(i, j int) bool { return rank(out[i]) < rank(out[j]) })
+	sorted := slices.Clone(links)
+	sort.SliceStable(sorted, func(i, j int) bool { return rank(sorted[i].typ) < rank(sorted[j].typ) })
+	out := make([]string, len(sorted))
+	for i, l := range sorted {
+		out[i] = l.href
+	}
 	return out
 }
 
@@ -669,7 +714,9 @@ func titleFromURL(raw string) string {
 	if base == "." || base == "/" || base == "" {
 		return u.Hostname()
 	}
-	base = strings.TrimSuffix(base, path.Ext(base))
+	if ext := path.Ext(base); pageExts[strings.ToLower(ext)] {
+		base = strings.TrimSuffix(base, ext)
+	}
 	base = strings.NewReplacer("-", " ", "_", " ").Replace(base)
 	if base == "" {
 		return u.Hostname()
@@ -678,14 +725,25 @@ func titleFromURL(raw string) string {
 	return string(unicode.ToUpper(r)) + base[size:]
 }
 
+// fileExts are extensions of sitemap entries that are files, not pages.
+// Anything else is treated as a page, so slugs like "go-1.22-released" work.
+var fileExts = map[string]bool{}
+
+func init() {
+	for _, e := range strings.Fields(`.7z .apk .atom .avif .bmp .css .csv .dmg .doc .docx .eot .epub .exe .gif .gz
+		.ico .iso .jpeg .jpg .js .json .m4a .map .mjs .mov .mp3 .mp4 .ogg .otf .pdf .png .ppt .pptx .rar
+		.rss .svg .tar .tgz .ttf .wav .webm .webp .woff .woff2 .xls .xlsx .xml .zip`) {
+		fileExts[e] = true
+	}
+}
+
 // readablePath filters out sitemap entries that are files rather than pages.
 func readablePath(p string) bool {
-	switch strings.ToLower(path.Ext(p)) {
-	case "", ".html", ".htm", ".md", ".php", ".txt":
-		return true
-	}
-	return false
+	return !fileExts[strings.ToLower(path.Ext(p))]
 }
+
+// pageExts are extensions that titleFromURL strips from a slug.
+var pageExts = map[string]bool{".html": true, ".htm": true, ".php": true, ".md": true, ".txt": true}
 
 func parseDate(s string) time.Time {
 	s = strings.TrimSpace(s)

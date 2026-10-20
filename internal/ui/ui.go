@@ -1,4 +1,4 @@
-// Package ui is the terminal reader: a list of everything on the site, a
+// Package ui is the terminal reader. It has a list of everything on the site, a
 // reader for one entry, and a help screen. The same model runs over SSH and
 // in a local terminal.
 package ui
@@ -328,7 +328,10 @@ func (m *Model) follow(n int) {
 		m.open(e, true)
 		return
 	}
-	m.status = "Link [" + strconv.Itoa(n) + "] " + ansi.SetHyperlink(link.URL) + link.URL + ansi.ResetHyperlink()
+	m.status = "Link [" + strconv.Itoa(n) + "] " + link.URL
+	if render.Clickable(link.URL) {
+		m.status = "Link [" + strconv.Itoa(n) + "] " + ansi.SetHyperlink(link.URL) + link.URL + ansi.ResetHyperlink()
+	}
 }
 
 func (m *Model) open(e *content.Entry, push bool) {

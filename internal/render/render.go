@@ -100,7 +100,7 @@ func numberLinks(doc ast.Node, source []byte, base string) ([]byte, []Link) {
 		return ast.WalkContinue, nil
 	})
 	for _, l := range targets {
-		dest := string(l.Destination)
+		dest := linkDestination(l.Destination)
 		if dest == "" || strings.HasPrefix(dest, "#") {
 			continue
 		}

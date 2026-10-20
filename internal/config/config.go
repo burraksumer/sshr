@@ -55,7 +55,7 @@ func Default() Config {
 	}
 }
 
-// Load reads path (if it exists) over the defaults, then applies SSHR_*
+// Load reads path, if it exists, over the defaults, then applies SSHR_*
 // environment variables. A missing file is not an error unless required.
 func Load(path string, required bool) (Config, error) {
 	cfg := Default()
@@ -152,9 +152,10 @@ func ParseSiteURL(raw string) (*url.URL, error) {
 	return u, nil
 }
 
-// Hosts returns where sshr may fetch from: the site's host, its www or bare
-// variant, and AllowedHosts. Entries are "host" (ports 80 and 443) or
-// "host:port". A site URL with an explicit port allows only that port.
+// Hosts returns where sshr may fetch from, which is the site's host, its www
+// or bare variant, and AllowedHosts. A "host" entry allows ports 80 and 443,
+// and "host:port" allows that port. A site URL with an explicit port allows
+// only that port.
 func (c Config) Hosts(site *url.URL) []string {
 	h := strings.ToLower(site.Hostname())
 	withPort := func(host string) string {

@@ -8,7 +8,7 @@ url = "https://example.com"
 # fetches nothing outside this list and the site's own host.
 # allowed_hosts = ["cdn.example.com", "feeds.example.com:8443"]
 
-# How often to re-read the site (at least 1m), and how many posts and pages
+# How often to re-read the site, at least 1m, and how many posts and pages
 # to keep.
 # refresh = "15m"
 # max_entries = 200

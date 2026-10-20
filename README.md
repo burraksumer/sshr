@@ -16,10 +16,12 @@ sshr serves a website's posts and pages as a terminal reader over SSH. Point it 
 
 The site doesn't need any changes. sshr reads what it already publishes:
 
-1. `robots.txt`, to check what it may fetch, how fast (`Crawl-delay`), and where the sitemaps are
-2. feed links in the homepage `<head>` (JSON Feed, Atom or RSS), or `/feed.json`, `/feed.xml`, `/atom.xml`, `/rss.xml`, `/index.xml` and `/feed` when there are none
+1. `robots.txt`, to check what it may fetch, how fast it may go and where the sitemaps are
+2. feed links in the homepage `<head>`, preferring JSON Feed, then Atom, then RSS, and then the common paths `/feed.json`, `/feed.xml`, `/atom.xml`, `/rss.xml`, `/index.xml` and `/feed`
 3. the sitemap, for pages the feed doesn't list
 4. each page that the feed only summarizes. sshr asks for `text/markdown` first, and when the site sends HTML it extracts the article with Readability
+
+A site URL with a path, like `https://example.com/blog`, limits sshr to that part of the site.
 
 ## Run it
 
@@ -33,14 +35,14 @@ docker run -d --name sshr -p 22:2222 \
   sshr
 ```
 
-From source (Go 1.27):
+The volume holds the host key. Without it, visitors get a "host key changed" warning every time the container is recreated.
+
+From source, with Go 1.27:
 
 ```sh
 go build -o sshr ./cmd/sshr
 ./sshr serve --url https://example.com --listen :2222
 ```
-
-The volume holds the host key. Without it, visitors get a "host key changed" warning every time the container is recreated.
 
 To see what sshr finds on a site before you deploy, run `sshr check https://example.com`. To read a site in your own terminal with no server, run `sshr read https://example.com`.
 
@@ -52,13 +54,15 @@ SSH sends no hostname, so `ssh example.com` connects to whatever answers on port
 ssh.example.com.  A  203.0.113.10
 ```
 
-If you use Cloudflare, that record has to be DNS-only (grey cloud). Cloudflare's proxy only forwards HTTP. A DNS-only record does publish the server's real IP.
+On Cloudflare, that record has to be DNS-only, shown as a grey cloud, because Cloudflare's proxy only forwards HTTP. A DNS-only record does publish the server's real IP.
 
 If the machine already runs OpenSSH on port 22 for your own logins, move one of them. Either OpenSSH goes to another port and sshr takes 22, or sshr stays on 2222 and visitors run `ssh -p 2222 ssh.example.com`.
 
 ## Configuration
 
-Everything except the URL has a default. See [`sshr.example.toml`](sshr.example.toml) for every option. sshr reads `sshr.toml` from the working directory if it exists. A file named with `--config` or `SSHR_CONFIG` must exist. In Docker, mount it at `/etc/sshr/sshr.toml`. `SSHR_URL`, `SSHR_LISTEN` and `SSHR_HOST_KEY` override the file. Set `SSHR_DEBUG=1` to log every fetch.
+Everything except the URL has a default. See [`sshr.example.toml`](sshr.example.toml) for every option.
+
+sshr reads `sshr.toml` from the working directory if it exists. A file named with `--config` or `SSHR_CONFIG` must exist. In Docker the working directory is `/data`, so mount the file at `/data/sshr.toml`. `SSHR_URL`, `SSHR_LISTEN` and `SSHR_HOST_KEY` override the file, and `--url` and `--listen` override both. Set `SSHR_DEBUG=1` to log every fetch.
 
 ## Keys
 
@@ -75,7 +79,7 @@ Everything except the URL has a default. See [`sshr.example.toml`](sshr.example.
 | `3` `enter` | follow link [3] |
 | `h` `esc` `q` | back |
 
-Links are numbered in the text, and the full URLs are listed at the end of each entry. A link to another page on the same site opens in the reader. Terminals that support OSC 8 make the URLs clickable.
+Links are numbered in the text, and the full URLs are listed at the end of each entry. A link to another page on the same site opens in the reader. In terminals that support OSC 8, http, https and mailto links are clickable. Other schemes are shown as text only.
 
 ## Security
 
@@ -83,9 +87,10 @@ Visitors are anonymous strangers, so sshr is built to give them nothing but the 
 
 - It never runs a shell or any other program. Commands, SFTP and other subsystems, port forwarding and agent forwarding are all refused.
 - Any public key is accepted after the SSH layer verifies its signature. Visitors without keys get keyboard-interactive auth with no prompts.
-- sshr strips control and escape bytes from everything it fetches, along with character references like `&#27;` that would decode to them, so a post can't send escape codes to a visitor's terminal. Only sshr's renderer writes escape sequences.
-- It only fetches from the site's own host (plus `www.`) and `allowed_hosts`, on ports 80 and 443 or the port in the site URL, redirects included. robots.txt applies to redirects too. Content can't point the fetcher at other machines or other services on the same machine.
-- Concurrent connections and sessions are capped per IP and in total. New sessions per IP are rate limited. Sessions end after an idle timeout and a maximum duration.
+- sshr strips control and escape bytes from everything it fetches. It also neutralizes character references like `&#27;` that the renderer would decode into them, and it filters the rendered output so only its own styling and links get through. A post can't send escape codes to a visitor's terminal.
+- It only fetches from the site's own host and its `www.` variant, plus `allowed_hosts`. That means ports 80 and 443, or the port in the site URL, and redirects get the same check. Content can't point the fetcher at other machines or at other services on the same machine.
+- It follows each host's robots.txt, on redirects too. When robots.txt can't be fetched or answers with a server error, sshr fetches nothing from that host.
+- Connections and sessions are capped per client and in total. IPv6 clients count per /64. New sessions per client are rate limited, and a connection that doesn't open a session within 30 seconds is closed. Sessions end after an idle timeout and a maximum duration.
 - Visitors only ever read from the in-memory snapshot. Fetching happens in the background on a timer, so a flood of visitors never turns into requests to your site.
 - Logs record IPs and session length, never key fingerprints.
 

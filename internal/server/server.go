@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -78,7 +79,7 @@ func New(cfg Config, store *content.Store, log *slog.Logger) (*Server, error) {
 		wish.WithIdleTimeout(cfg.IdleTimeout),
 		wish.WithMaxTimeout(cfg.MaxTimeout),
 		wish.WithMiddleware(
-			// Middleware runs bottom to top: the last one listed runs first.
+			// Middleware runs bottom to top, so the last one listed runs first.
 			bm.Middleware(func(s ssh.Session) (tea.Model, []tea.ProgramOption) {
 				return ui.New(store), nil
 			}),
@@ -87,6 +88,7 @@ func New(cfg Config, store *content.Store, log *slog.Logger) (*Server, error) {
 			// New sessions per IP: a burst of MaxPerIP, then one per second.
 			ratelimiter.Middleware(newRateLimiter(rate.Every(time.Second), cfg.MaxPerIP)),
 			logSessions(log),
+			markSession(),
 		),
 	)
 	if err != nil {
@@ -100,9 +102,20 @@ func New(cfg Config, store *content.Store, log *slog.Logger) (*Server, error) {
 			log.Warn("connection refused", "ip", ip, "reason", "limit")
 			return nil
 		}
-		return &trackedConn{Conn: c, release: release}
+		tc := &trackedConn{Conn: c, release: release}
+		// Authentication needs no prompts, so a client could hold a slot
+		// without ever reading. Close connections that don't open a
+		// session soon after connecting.
+		tc.timer = time.AfterFunc(sessionDeadline, func() {
+			if !tc.started.Load() {
+				log.Info("closing connection without a session", "ip", ip)
+				_ = tc.Close()
+			}
+		})
+		ctx.SetValue(connKey{}, tc)
+		return tc
 	}
-	// Explicit, even though these are the library defaults: no forwarding
+	// These match the library defaults but are set explicitly. No forwarding
 	// of any kind and no subsystems such as SFTP.
 	srv.LocalPortForwardingCallback = nil
 	srv.ReversePortForwardingCallback = nil
@@ -227,14 +240,38 @@ func (l *limiter) acquire(ip string) (release func(), ok bool) {
 	}, true
 }
 
+// sessionDeadline is how long a connection may stay open before it starts a
+// session.
+const sessionDeadline = 30 * time.Second
+
+type connKey struct{}
+
 type trackedConn struct {
 	net.Conn
 	release func()
+	timer   *time.Timer
+	started atomic.Bool
 }
 
 func (c *trackedConn) Close() error {
+	if c.timer != nil {
+		c.timer.Stop()
+	}
 	c.release()
 	return c.Conn.Close()
+}
+
+// markSession records that a connection started a session, which keeps
+// it from being closed by sessionDeadline.
+func markSession() wish.Middleware {
+	return func(next ssh.Handler) ssh.Handler {
+		return func(s ssh.Session) {
+			if tc, ok := s.Context().Value(connKey{}).(*trackedConn); ok {
+				tc.started.Store(true)
+			}
+			next(s)
+		}
+	}
 }
 
 // clientKey is what the per-client limits count. IPv6 clients are grouped by
@@ -263,7 +300,7 @@ func safeTerm(t string) string {
 	return t
 }
 
-// rateLimiter limits new sessions per client key: a burst, then a steady rate.
+// rateLimiter limits new sessions per client key to a burst, then a steady rate.
 type rateLimiter struct {
 	rate  rate.Limit
 	burst int
