@@ -143,3 +143,21 @@ func TestResizeDuringPendingRenderKeepsPosition(t *testing.T) {
 		t.Errorf("keepPos = %v, want 0.7", got)
 	}
 }
+
+// A resize that settles after opening another entry doesn't move it to the
+// old entry's position.
+func TestResizeDoesNotLeakToNextEntry(t *testing.T) {
+	a := &content.Entry{URL: "https://x.example/a", Body: strings.Repeat("line\n\n", 300)}
+	b := &content.Entry{URL: "https://x.example/b", Body: strings.Repeat("line\n\n", 300)}
+	m := Model{st: newStyles(true), width: 80, height: 20, vp: viewport.New()}
+	m.open(a, false)
+	m.vp.SetYOffset(300)
+	tm, cmd := m.Update(tea.WindowSizeMsg{Width: 70, Height: 20})
+	got := tm.(Model)
+	got.open(b, true)
+	tm, _ = got.Update(cmd())
+	got = tm.(Model)
+	if off := got.vp.YOffset(); off != 0 {
+		t.Errorf("entry b opened at offset %d, want 0", off)
+	}
+}

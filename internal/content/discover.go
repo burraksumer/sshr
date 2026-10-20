@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
-	"net/http"
 	"net/url"
 	"path"
 	"regexp"
@@ -57,9 +56,13 @@ func capBody(s string) string {
 	return strings.ToValidUTF8(cut, "") + "\n\n*This entry was cut short because it is very long.*\n"
 }
 
-// maxStale is how many refreshes in a row a copy is kept for a page that
-// answers but can't be read.
+// maxStale is how many refreshes in a row a copy is kept for a page, feed or
+// sitemap that answers but can't be read.
 const maxStale = 8
+
+// keepStale reports whether a copy that has been kept stale times in a row
+// may be kept once more.
+func keepStale(stale int) bool { return stale < maxStale }
 
 // DefaultPageBudget is how long a refresh spends fetching pages unless
 // configured otherwise. With a long Crawl-delay, the rest come in later
@@ -113,6 +116,9 @@ type Discoverer struct {
 	// MaxEntries caps how many documents a site may have.
 	MaxEntries int
 	Log        *slog.Logger
+
+	homeOnce             sync.Once
+	homeBase, homeDirKey string
 }
 
 // Discover fetches the site and returns a new snapshot. prev is the last
@@ -280,6 +286,13 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 	return finish(site, kept), nil
 }
 
+// hash records the body's hash for render caching.
+func (e *Entry) hash() {
+	h := fnv.New64a()
+	h.Write([]byte(e.Body))
+	e.bodyHash, e.hashed = h.Sum64(), true
+}
+
 func entryURLs(entries []*Entry) []string {
 	out := make([]string, len(entries))
 	for i, e := range entries {
@@ -292,9 +305,7 @@ func entryURLs(entries []*Entry) []string {
 func finish(site *Site, kept []*Entry) *Site {
 	for _, e := range kept {
 		if !e.hashed {
-			h := fnv.New64a()
-			h.Write([]byte(e.Body))
-			e.bodyHash, e.hashed = h.Sum64(), true
+			e.hash()
 		}
 		if e.Title == "" && e.URL != "" {
 			// The URL path is percent-decoded and can hold control bytes.
@@ -318,7 +329,6 @@ func finish(site *Site, kept []*Entry) *Site {
 		return false
 	})
 	site.Entries = kept
-	site.FetchedAt = time.Now()
 	site.index()
 	return site
 }
@@ -369,7 +379,7 @@ func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []feedLink,
 			return reuseFeed(site, prev), raw
 		}
 		if res.Status != 200 {
-			if prev != nil && raw == prev.feedURL && transient(res.Status) {
+			if prev != nil && raw == prev.feedURL && fetch.Transient(res.Status) {
 				prevFailed = true
 			}
 			continue
@@ -379,7 +389,7 @@ func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []feedLink,
 			// An HTML maintenance page in place of the feed, say. Keep the
 			// old entries for a few refreshes, not forever.
 			d.Client.Forget(raw)
-			if prev != nil && raw == prev.feedURL && prev.feedStale < maxStale {
+			if prev != nil && raw == prev.feedURL && keepStale(prev.feedStale) {
 				prevFailed, garbage = true, true
 			}
 			continue
@@ -496,11 +506,6 @@ func passing(err error) bool {
 	return true
 }
 
-// transient reports whether an HTTP status is worth keeping old data over.
-func transient(status int) bool {
-	return status >= 500 || status == http.StatusTooManyRequests
-}
-
 func entryFromItem(item *gofeed.Item, feedURL *url.URL) *Entry {
 	e := &Entry{Kind: Post, fromFeed: true}
 	link := item.Link
@@ -540,6 +545,7 @@ func entryFromItem(item *gofeed.Item, feedURL *url.URL) *Entry {
 	}
 	if body != "" {
 		e.Body = capBody(sanitize.Text(toMarkdown(body, base)))
+		e.hash()
 	}
 	if e.URL == "" && e.Body == "" {
 		return nil
@@ -637,7 +643,7 @@ func (d *Discoverer) fillBody(ctx context.Context, e *Entry, old *Entry) error {
 		d.Client.Unmove(e.URL)
 		// It may be a maintenance redirect, so keep an old copy for a few
 		// refreshes, as for a page that can't be read.
-		if hasOld && old.stale < maxStale {
+		if hasOld && keepStale(old.stale) {
 			reuse(e, old)
 			e.stale = old.stale + 1
 			return fmt.Errorf("redirects away to %q, kept previous copy", res.URL)
@@ -666,7 +672,7 @@ func (d *Discoverer) fillBody(ctx context.Context, e *Entry, old *Entry) error {
 		d.Client.Forget(e.URL)
 		// The page answered but couldn't be read, which may not get
 		// better. Keep the old copy for a few refreshes, not forever.
-		if hasOld && old.stale < maxStale {
+		if hasOld && keepStale(old.stale) {
 			reuse(e, old)
 			e.stale = old.stale + 1
 			return fmt.Errorf("kept previous copy: %w", err)
@@ -697,11 +703,22 @@ func (d *Discoverer) redirectedAway(from, to *url.URL) bool {
 // isHome reports whether the normalized key k is the site's homepage: the
 // site URL, or its directory when the site URL names a file.
 func (d *Discoverer) isHome(k string) bool {
-	return k == normalize(d.Base) || k == d.homeDir()
+	base, dir := d.homeKeys()
+	return k == base || k == dir
 }
 
 func (d *Discoverer) homeDir() string {
-	return normalize(d.Base.ResolveReference(&url.URL{Path: d.scope()}))
+	_, dir := d.homeKeys()
+	return dir
+}
+
+// homeKeys computes the homepage keys once, since Base doesn't change.
+func (d *Discoverer) homeKeys() (base, dir string) {
+	d.homeOnce.Do(func() {
+		d.homeBase = normalize(d.Base)
+		d.homeDirKey = normalize(d.Base.ResolveReference(&url.URL{Path: d.scope()}))
+	})
+	return d.homeBase, d.homeDirKey
 }
 
 // keepPrevious reports whether a fetch result means an earlier copy should
@@ -714,7 +731,7 @@ func keepPrevious(res *fetch.Response, err error, hasOld bool) bool {
 	case err != nil:
 		return passing(err)
 	}
-	return res.NotModified || transient(res.Status)
+	return res.NotModified || fetch.Transient(res.Status)
 }
 
 // readPage fills e from a fetched page, as markdown or extracted HTML.
@@ -871,7 +888,7 @@ func (d *Discoverer) loadSitemaps(ctx context.Context, roots []string, prev *Sit
 			switch {
 			case isSitemap:
 				c = parseSitemap(doc, res.URL, scope, maxURLs)
-			case hasOld && old.stale < maxStale:
+			case hasOld && keepStale(old.stale):
 				// Not a sitemap, like an error page sent with status 200.
 				// Well-formed HTML parses as XML, so the root element
 				// decides. Keep the old copy for a few refreshes.

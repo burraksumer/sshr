@@ -394,9 +394,9 @@ func (c *Client) fetchRobots(ctx context.Context, u *url.URL) (robotsEntry, erro
 	e := robotsEntry{data: disallowAll, unavailable: true}
 	resp, err := c.get(ctx, ru, "text/plain", false, false, -maxRobotsBytes)
 	switch {
-	case errors.Is(err, ErrNotAllowed), errors.Is(err, errTooManyRedirects):
+	case errors.Is(err, ErrNotAllowed), errors.Is(err, ErrPermanent):
 		// robots.txt redirects to a host sshr won't contact, like a CDN,
-		// or redirects too many times. RFC 9309 treats a robots.txt that
+		// redirects too many times or to nowhere. RFC 9309 treats a robots.txt that
 		// can't be followed as missing, which allows everything. Only
 		// network errors and 5xx disallow.
 		e.data, _ = robotstxt.FromStatusAndBytes(http.StatusNotFound, nil)
@@ -412,7 +412,7 @@ func (c *Client) fetchRobots(ctx context.Context, u *url.URL) (robotsEntry, erro
 		if resp.Status == http.StatusTooManyRequests {
 			data = disallowAll
 		}
-		e.data, e.unavailable = data, resp.Status >= 500 || resp.Status == http.StatusTooManyRequests
+		e.data, e.unavailable = data, Transient(resp.Status)
 	}
 	c.mu.Lock()
 	e.round = c.round
@@ -566,6 +566,12 @@ func (c *Client) follow(ctx context.Context, u *url.URL, start, accept string, c
 }
 
 var xmlEncoding = regexp.MustCompile(`^(?:\xef\xbb\xbf)?\s*<\?xml[^>]*\sencoding=["']([A-Za-z0-9._:-]+)["']`)
+
+// Transient reports whether an HTTP status means a passing outage: a server
+// error, or 429 Too Many Requests.
+func Transient(status int) bool {
+	return status >= 500 || status == http.StatusTooManyRequests
+}
 
 // toUTF8 converts HTML, markdown and plain text in another charset, like
 // windows-1254 or ISO-8859-9, to UTF-8. The charset comes from the

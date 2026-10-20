@@ -183,3 +183,19 @@ func TestOnlyReaderRequestsAccepted(t *testing.T) {
 		}
 	}
 }
+
+// A command is refused even with a terminal, and nothing runs.
+func TestCommandRefused(t *testing.T) {
+	c := dial(t, startServer(t))
+	s, err := c.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RequestPty("xterm", 24, 80, nil); err != nil {
+		t.Fatal(err)
+	}
+	out, _ := s.CombinedOutput("cat /etc/passwd")
+	if !strings.Contains(string(out), "doesn't run commands") || strings.Contains(string(out), "root:") {
+		t.Errorf("output = %q", out)
+	}
+}

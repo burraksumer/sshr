@@ -182,7 +182,12 @@ func requirePTY() wish.Middleware {
 	return func(next ssh.Handler) ssh.Handler {
 		return func(s ssh.Session) {
 			if _, _, ok := s.Pty(); !ok {
-				wish.Fatalln(s, "sshr is an interactive reader and needs a terminal. Connect without a command, or add -t.")
+				wish.Fatalln(s, "sshr is an interactive reader and needs a terminal. Connect with plain ssh, without a command.")
+				return
+			}
+			// Commands are refused, not run, even with a terminal.
+			if len(s.Command()) > 0 {
+				wish.Fatalln(s, "sshr doesn't run commands. Connect with plain ssh, without a command.")
 				return
 			}
 			next(s)

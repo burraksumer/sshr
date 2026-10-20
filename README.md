@@ -102,8 +102,8 @@ These were measured on Linux with a small blog:
 |---|---|
 | binary | 27 MB |
 | Docker image | 22 MB |
-| memory, idle | 30 MB |
-| memory, 50 open sessions | 86 MB |
+| memory, idle | 29 MB |
+| memory, 50 open sessions | 95 MB |
 
 ## License
 

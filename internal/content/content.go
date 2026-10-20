@@ -70,7 +70,6 @@ type Site struct {
 	Title       string
 	Description string
 	Entries     []*Entry
-	FetchedAt   time.Time
 
 	feedURL                    string
 	feedStale                  int // refreshes in a row the feed was unreadable

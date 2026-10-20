@@ -472,3 +472,18 @@ func TestXHTMLEncodingFromDeclaration(t *testing.T) {
 		t.Errorf("declared encoding ignored: %q", got)
 	}
 }
+
+// A robots.txt that redirects to nowhere counts as missing, not as a
+// reason to block the whole site.
+func TestRobotsBadRedirectAllows(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusMovedPermanently) })
+	mux.HandleFunc("/page", func(w http.ResponseWriter, r *http.Request) {})
+	srv, c := testServer(t, mux.ServeHTTP)
+	if _, err := c.LoadRobots(context.Background(), mustURL(t, srv.URL)); err != nil {
+		t.Errorf("LoadRobots: %v", err)
+	}
+	if _, err := c.Get(context.Background(), mustURL(t, srv.URL+"/page"), "", false); err != nil {
+		t.Errorf("page blocked: %v", err)
+	}
+}

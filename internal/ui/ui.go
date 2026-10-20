@@ -410,6 +410,13 @@ func (m *Model) follow(n int) tea.Cmd {
 	return nil
 }
 
+// leave forgets a resize in progress, so its position isn't applied to
+// the next entry or kept after going back to the list.
+func (m *Model) leave() {
+	m.resizing = false
+	m.resizeGen++
+}
+
 func (m *Model) open(e *content.Entry, push bool) tea.Cmd {
 	// A click can open an entry while the search box has focus.
 	if m.filtering {
@@ -419,6 +426,7 @@ func (m *Model) open(e *content.Entry, push bool) tea.Cmd {
 	if push && m.entry != nil {
 		m.history = append(m.history, visit{m.entry, m.position()})
 	}
+	m.leave()
 	m.entry = e
 	m.screen = screenReader
 	m.digits, m.status = "", ""
@@ -427,6 +435,7 @@ func (m *Model) open(e *content.Entry, push bool) tea.Cmd {
 
 func (m *Model) back() tea.Cmd {
 	m.digits, m.status = "", ""
+	m.leave()
 	if n := len(m.history); n > 0 {
 		v := m.history[n-1]
 		m.history = m.history[:n-1]
