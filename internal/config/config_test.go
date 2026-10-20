@@ -46,3 +46,32 @@ func TestLoadRequired(t *testing.T) {
 		t.Errorf("Load = %+v, %v", c, err)
 	}
 }
+
+func TestValidateProxy(t *testing.T) {
+	c := Default()
+	c.URL = "example.com"
+	c.ProxyProtocol = true
+	if c.Validate() == nil {
+		t.Error("proxy_protocol without trusted_proxies: no error")
+	}
+	c.TrustedProxies = []string{"10.0.0.0/8", "192.0.2.1"}
+	if err := c.Validate(); err != nil {
+		t.Errorf("valid proxies: %v", err)
+	}
+	c.TrustedProxies = []string{"10.0.0.0/33"}
+	if c.Validate() == nil {
+		t.Error("bad CIDR: no error")
+	}
+}
+
+func TestHostsKeepPort(t *testing.T) {
+	c := Config{AllowedHosts: []string{"cdn.example.com"}}
+	u, _ := ParseSiteURL("http://localhost:8080")
+	if got := c.Hosts(u); got[0] != "localhost:8080" || len(got) != 2 {
+		t.Errorf("Hosts = %v", got)
+	}
+	u, _ = ParseSiteURL("example.com")
+	if got := c.Hosts(u); len(got) != 3 || got[0] != "example.com" || got[1] != "www.example.com" {
+		t.Errorf("Hosts = %v", got)
+	}
+}

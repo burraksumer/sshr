@@ -4,12 +4,14 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/burraksumer/sshr/internal/content"
 )
 
 // Config is the full sshr configuration. Only URL is required.
@@ -41,7 +43,7 @@ type Config struct {
 func Default() Config {
 	return Config{
 		Refresh:     Duration(15 * time.Minute),
-		MaxEntries:  200,
+		MaxEntries:  content.DefaultMaxEntries,
 		Listen:      ":2222",
 		HostKey:     ".sshr/host_ed25519",
 		MaxSessions: 200,
@@ -100,6 +102,14 @@ func (c Config) Validate() error {
 			return fmt.Errorf("%s must be positive, got %d", name, n)
 		}
 	}
+	if c.ProxyProtocol && len(c.TrustedProxies) == 0 {
+		return errors.New("proxy_protocol needs trusted_proxies, or every connection is rejected")
+	}
+	for _, p := range c.TrustedProxies {
+		if _, _, err := net.ParseCIDR(p); err != nil && net.ParseIP(p) == nil {
+			return fmt.Errorf("trusted_proxies: %q is not an IP address or CIDR range", p)
+		}
+	}
 	if c.LogFormat != "json" && c.LogFormat != "text" {
 		return fmt.Errorf(`log_format must be "json" or "text", got %q`, c.LogFormat)
 	}
@@ -136,15 +146,22 @@ func ParseSiteURL(raw string) (*url.URL, error) {
 	return u, nil
 }
 
-// Hosts returns every host sshr may fetch from: the site's host, its www or
-// bare variant, and AllowedHosts.
+// Hosts returns where sshr may fetch from: the site's host, its www or bare
+// variant, and AllowedHosts. Entries are "host" (ports 80 and 443) or
+// "host:port". A site URL with an explicit port allows only that port.
 func (c Config) Hosts(site *url.URL) []string {
 	h := strings.ToLower(site.Hostname())
-	hosts := []string{h}
+	withPort := func(host string) string {
+		if p := site.Port(); p != "" {
+			return net.JoinHostPort(host, p)
+		}
+		return host
+	}
+	hosts := []string{withPort(h)}
 	if bare, ok := strings.CutPrefix(h, "www."); ok {
-		hosts = append(hosts, bare)
+		hosts = append(hosts, withPort(bare))
 	} else if strings.Contains(h, ".") && hasLetters(h) {
-		hosts = append(hosts, "www."+h)
+		hosts = append(hosts, withPort("www."+h))
 	}
 	for _, a := range c.AllowedHosts {
 		hosts = append(hosts, strings.ToLower(strings.TrimSpace(a)))

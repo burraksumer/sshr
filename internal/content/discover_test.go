@@ -87,7 +87,7 @@ func fakeSite(t *testing.T) *httptest.Server {
 func TestDiscover(t *testing.T) {
 	srv := fakeSite(t)
 	base, _ := url.Parse(srv.URL + "/")
-	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Hostname()}, Rate: 1000, Burst: 100}), Base: base}
+	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Host}, Rate: 1000, Burst: 100}), Base: base}
 
 	var partial *Site
 	site, err := d.Discover(context.Background(), nil, func(s *Site) { partial = s })
@@ -208,7 +208,7 @@ func TestFallbacks(t *testing.T) {
 	defer srv.Close()
 
 	base, _ := url.Parse(srv.URL + "/")
-	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Hostname()}, Rate: 1000, Burst: 100}), Base: base}
+	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Host}, Rate: 1000, Burst: 100}), Base: base}
 	site, err := d.Discover(context.Background(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -250,7 +250,7 @@ func TestRefreshRetriesDroppedPost(t *testing.T) {
 	defer srv.Close()
 
 	base, _ := url.Parse(srv.URL + "/")
-	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Hostname()}, Rate: 1000, Burst: 100}), Base: base}
+	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Host}, Rate: 1000, Burst: 100}), Base: base}
 	first, err := d.Discover(context.Background(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -267,5 +267,93 @@ func TestRefreshRetriesDroppedPost(t *testing.T) {
 	}
 	if second.Lookup(srv.URL+"/full") == nil {
 		t.Error("full post lost on 304")
+	}
+}
+
+// With url = example.com/blog, feeds are looked up under /blog first and
+// sitemap pages outside /blog are left out.
+func TestSubpathScope(t *testing.T) {
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("/blog/{$}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<html><head><title>Blog</title></head></html>`))
+	})
+	mux.HandleFunc("/blog/feed.xml", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`<?xml version="1.0"?><rss version="2.0"><channel><title>Blog</title><item><title>Post</title>
+<link>` + srv.URL + `/blog/post</link><content:encoded xmlns:content="http://purl.org/rss/1.0/modules/content/">Body</content:encoded></item></channel></rss>`))
+	})
+	mux.HandleFunc("/sitemap.xml", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`<?xml version="1.0"?><urlset><url><loc>/blog/about</loc></url><url><loc>/shop</loc></url></urlset>`))
+	})
+	page := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/markdown")
+		w.Write([]byte("Page text\n"))
+	}
+	mux.HandleFunc("/blog/about", page)
+	mux.HandleFunc("/shop", page)
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+
+	base, _ := url.Parse(srv.URL + "/blog")
+	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Host}, Rate: 1000, Burst: 100}), Base: base}
+	site, err := d.Discover(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if site.Lookup(srv.URL+"/blog/post") == nil {
+		t.Error("feed under /blog was not found")
+	}
+	if site.Lookup(srv.URL+"/blog/about") == nil {
+		t.Error("in-scope sitemap page missing")
+	}
+	if site.Lookup(srv.URL+"/shop") != nil {
+		t.Error("sitemap page outside /blog was included")
+	}
+}
+
+// A page that answers 304 keeps the feed's date, and a server that answers
+// 304 without being asked doesn't crash discovery.
+func TestPage304KeepsFeedDate(t *testing.T) {
+	var feedCalls atomic.Int32
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("/feed.json", func(w http.ResponseWriter, r *http.Request) {
+		date := "2024-01-01T00:00:00Z"
+		if feedCalls.Add(1) > 1 {
+			date = "2024-06-01T00:00:00Z"
+		}
+		w.Header().Set("Content-Type", "application/feed+json")
+		w.Write([]byte(`{"version":"https://jsonfeed.org/version/1.1","title":"T","items":[
+{"id":"1","url":"` + srv.URL + `/post","title":"Post","summary":"s","date_modified":"` + date + `"}]}`))
+	})
+	mux.HandleFunc("/post", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"p"`)
+		if r.Header.Get("If-None-Match") == `"p"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("Content-Type", "text/markdown")
+		w.Write([]byte("Post body\n"))
+	})
+	mux.HandleFunc("/sitemap.xml", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotModified)
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+
+	base, _ := url.Parse(srv.URL + "/")
+	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Host}, Rate: 1000, Burst: 100}), Base: base}
+	first, err := d.Discover(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := d.Discover(context.Background(), first, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := second.Lookup(srv.URL + "/post")
+	if e == nil || e.Date.Month() != 6 || !strings.Contains(e.Body, "Post body") {
+		t.Errorf("entry after 304 = %+v", e)
 	}
 }

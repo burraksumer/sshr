@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -26,7 +27,7 @@ const UserAgent = "sshr/0.1 (+https://sshr.dev)"
 const robotsAgent = "sshr"
 
 var (
-	// ErrNotAllowed means the URL's host is not on the allowlist.
+	// ErrNotAllowed means the URL's host and port are not on the allowlist.
 	ErrNotAllowed = errors.New("fetch: host not allowed")
 	// ErrDisallowed means robots.txt asks sshr not to fetch the URL.
 	ErrDisallowed = errors.New("fetch: disallowed by robots.txt")
@@ -34,8 +35,9 @@ var (
 
 // Options configures a Client.
 type Options struct {
-	// Hosts lists the hostnames the client may contact. Requests and redirects
-	// to any other host fail with ErrNotAllowed.
+	// Hosts lists where the client may connect, as "host" or "host:port". A
+	// bare host allows ports 80 and 443 only. Requests and redirects anywhere
+	// else fail with ErrNotAllowed.
 	Hosts []string
 	// Rate is the steady request rate per second. Burst allows short spikes.
 	Rate  float64
@@ -59,19 +61,27 @@ type Response struct {
 
 type validators struct {
 	etag, lastModified string
+	round              int
 }
 
 // Client fetches documents from a fixed set of hosts.
 type Client struct {
 	http     *http.Client
-	hosts    map[string]bool
+	hosts    map[string]bool // "host:port"
 	limiter  *rate.Limiter
+	rate     rate.Limit
+	burst    int
 	maxBytes int64
 
 	mu         sync.Mutex
 	robots     *robotstxt.Group
 	validators map[string]validators
+	round      int
 }
+
+// skipRobots marks requests, and so their redirects, that ignore robots.txt.
+// Only the robots.txt fetch itself uses it.
+type skipRobots struct{}
 
 // New returns a Client limited to opts.Hosts.
 func New(opts Options) *Client {
@@ -90,11 +100,20 @@ func New(opts Options) *Client {
 	c := &Client{
 		hosts:      map[string]bool{},
 		limiter:    rate.NewLimiter(rate.Limit(opts.Rate), opts.Burst),
+		rate:       rate.Limit(opts.Rate),
+		burst:      opts.Burst,
 		maxBytes:   opts.MaxBytes,
 		validators: map[string]validators{},
 	}
 	for _, h := range opts.Hosts {
-		c.hosts[strings.ToLower(h)] = true
+		h = strings.ToLower(strings.TrimSpace(h))
+		if host, port, err := net.SplitHostPort(h); err == nil {
+			c.hosts[net.JoinHostPort(host, port)] = true
+			continue
+		}
+		h = strings.Trim(h, "[]")
+		c.hosts[net.JoinHostPort(h, "80")] = true
+		c.hosts[net.JoinHostPort(h, "443")] = true
 	}
 	c.http = &http.Client{
 		Timeout: opts.Timeout,
@@ -102,10 +121,35 @@ func New(opts Options) *Client {
 			if len(via) >= 5 {
 				return errors.New("fetch: too many redirects")
 			}
-			return c.checkURL(req.URL)
+			if err := c.checkURL(req.URL); err != nil {
+				return err
+			}
+			if req.Context().Value(skipRobots{}) == nil && !c.robotsAllow(req.URL) {
+				return fmt.Errorf("%w: redirect to %s", ErrDisallowed, req.URL)
+			}
+			return nil
 		},
 	}
 	return c
+}
+
+// StartRound begins a refresh. Validators not used again before EndRound are
+// forgotten, so URLs that left the site don't pile up.
+func (c *Client) StartRound() {
+	c.mu.Lock()
+	c.round++
+	c.mu.Unlock()
+}
+
+// EndRound drops validators for URLs not requested since StartRound.
+func (c *Client) EndRound() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for k, v := range c.validators {
+		if v.round < c.round {
+			delete(c.validators, k)
+		}
+	}
 }
 
 // Allowed reports whether u is on the allowlist and not blocked by robots.txt.
@@ -117,8 +161,12 @@ func (c *Client) checkURL(u *url.URL) error {
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return fmt.Errorf("%w: scheme %q", ErrNotAllowed, u.Scheme)
 	}
-	if !c.hosts[strings.ToLower(u.Hostname())] {
-		return fmt.Errorf("%w: %s", ErrNotAllowed, u.Hostname())
+	port := u.Port()
+	if port == "" {
+		port = map[string]string{"http": "80", "https": "443"}[u.Scheme]
+	}
+	if !c.hosts[net.JoinHostPort(strings.ToLower(u.Hostname()), port)] {
+		return fmt.Errorf("%w: %s", ErrNotAllowed, u.Host)
 	}
 	return nil
 }
@@ -140,12 +188,12 @@ func (c *Client) robotsAllow(u *url.URL) bool {
 	return g.Test(p)
 }
 
-// LoadRobots fetches robots.txt for base and applies it to later requests.
-// It returns the Sitemap URLs listed in the file. A missing robots.txt allows
-// everything.
+// LoadRobots fetches robots.txt for base and applies it to later requests,
+// including its Crawl-delay. It returns the Sitemap URLs listed in the file. A
+// missing robots.txt allows everything.
 func (c *Client) LoadRobots(ctx context.Context, base *url.URL) ([]string, error) {
 	u := base.ResolveReference(&url.URL{Path: "/robots.txt"})
-	resp, err := c.get(ctx, u, "text/plain", false, false, c.maxBytes)
+	resp, err := c.get(context.WithValue(ctx, skipRobots{}, true), u, "text/plain", false, false, c.maxBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -154,9 +202,17 @@ func (c *Client) LoadRobots(ctx context.Context, base *url.URL) ([]string, error
 		// An unparseable file is treated like a missing one.
 		data, _ = robotstxt.FromStatusAndBytes(http.StatusNotFound, nil)
 	}
+	g := data.FindGroup(robotsAgent)
 	c.mu.Lock()
-	c.robots = data.FindGroup(robotsAgent)
+	c.robots = g
 	c.mu.Unlock()
+	if g != nil && g.CrawlDelay > 0 {
+		c.limiter.SetLimit(min(rate.Every(g.CrawlDelay), c.rate))
+		c.limiter.SetBurst(1)
+	} else {
+		c.limiter.SetLimit(c.rate)
+		c.limiter.SetBurst(c.burst)
+	}
 	return data.Sitemaps, nil
 }
 
@@ -192,19 +248,22 @@ func (c *Client) get(ctx context.Context, u *url.URL, accept string, conditional
 		req.Header.Set("Accept", accept)
 	}
 	key := u.String()
-	if conditional {
-		c.mu.Lock()
-		v, ok := c.validators[key]
-		c.mu.Unlock()
-		if ok {
+	sent := false
+	c.mu.Lock()
+	if v, ok := c.validators[key]; ok {
+		v.round = c.round
+		c.validators[key] = v
+		if conditional {
 			if v.etag != "" {
 				req.Header.Set("If-None-Match", v.etag)
 			}
 			if v.lastModified != "" {
 				req.Header.Set("If-Modified-Since", v.lastModified)
 			}
+			sent = true
 		}
 	}
+	c.mu.Unlock()
 
 	res, err := c.http.Do(req)
 	if err != nil {
@@ -214,6 +273,11 @@ func (c *Client) get(ctx context.Context, u *url.URL, accept string, conditional
 
 	out := &Response{URL: res.Request.URL, Status: res.StatusCode}
 	if res.StatusCode == http.StatusNotModified {
+		// Only trust a 304 that answers validators we sent. Callers keep
+		// their previous result, which doesn't exist otherwise.
+		if !sent {
+			return nil, fmt.Errorf("fetch: %s answered 304 to an unconditional request", u)
+		}
 		out.NotModified = true
 		return out, nil
 	}
@@ -232,6 +296,7 @@ func (c *Client) get(ctx context.Context, u *url.URL, accept string, conditional
 	if res.StatusCode == http.StatusOK {
 		v := validators{etag: res.Header.Get("ETag"), lastModified: res.Header.Get("Last-Modified")}
 		c.mu.Lock()
+		v.round = c.round
 		if v.etag != "" || v.lastModified != "" {
 			c.validators[key] = v
 		} else {

@@ -4,8 +4,9 @@
 url = "https://example.com"
 
 # Extra hosts sshr may fetch from, if your feed or pages live on another domain.
-# sshr fetches nothing outside this list and the site's own host.
-# allowed_hosts = ["cdn.example.com"]
+# A bare host allows ports 80 and 443; add ":port" for anything else. sshr
+# fetches nothing outside this list and the site's own host.
+# allowed_hosts = ["cdn.example.com", "feeds.example.com:8443"]
 
 # How often to re-read the site (at least 1m), and how many posts and pages
 # to keep.

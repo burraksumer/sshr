@@ -16,7 +16,7 @@ sshr serves a website's posts and pages as a terminal reader over SSH. Point it 
 
 The site doesn't need any changes. sshr reads what it already publishes:
 
-1. `robots.txt`, to check what it may fetch and to find sitemaps
+1. `robots.txt`, to check what it may fetch, how fast (`Crawl-delay`), and where the sitemaps are
 2. feed links in the homepage `<head>` (JSON Feed, Atom or RSS), or `/feed.json`, `/feed.xml`, `/atom.xml`, `/rss.xml`, `/index.xml` and `/feed` when there are none
 3. the sitemap, for pages the feed doesn't list
 4. each page that the feed only summarizes. sshr asks for `text/markdown` first, and when the site sends HTML it extracts the article with Readability
@@ -83,8 +83,8 @@ Visitors are anonymous strangers, so sshr is built to give them nothing but the 
 
 - It never runs a shell or any other program. Commands, SFTP and other subsystems, port forwarding and agent forwarding are all refused.
 - Any public key is accepted after the SSH layer verifies its signature. Visitors without keys get keyboard-interactive auth with no prompts.
-- sshr strips control and escape bytes from everything it fetches, so a post can't send escape codes to a visitor's terminal. Only sshr's renderer writes escape sequences.
-- It only fetches from the site's own host (plus `www.`) and `allowed_hosts`, redirects included. That keeps the page fetcher from reaching internal addresses.
+- sshr strips control and escape bytes from everything it fetches, along with character references like `&#27;` that would decode to them, so a post can't send escape codes to a visitor's terminal. Only sshr's renderer writes escape sequences.
+- It only fetches from the site's own host (plus `www.`) and `allowed_hosts`, on ports 80 and 443 or the port in the site URL, redirects included. robots.txt applies to redirects too. Content can't point the fetcher at other machines or other services on the same machine.
 - Concurrent connections and sessions are capped per IP and in total. New sessions per IP are rate limited. Sessions end after an idle timeout and a maximum duration.
 - Visitors only ever read from the in-memory snapshot. Fetching happens in the background on a timer, so a flood of visitors never turns into requests to your site.
 - Logs record IPs and session length, never key fingerprints.

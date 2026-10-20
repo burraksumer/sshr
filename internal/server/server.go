@@ -51,11 +51,8 @@ type Server struct {
 
 // New builds a server that shows store's content.
 func New(cfg Config, store *content.Store, log *slog.Logger) (*Server, error) {
-	if cfg.MaxSessions <= 0 {
-		cfg.MaxSessions = 200
-	}
-	if cfg.MaxPerIP <= 0 {
-		cfg.MaxPerIP = 5
+	if cfg.MaxSessions <= 0 || cfg.MaxPerIP <= 0 {
+		return nil, fmt.Errorf("server: MaxSessions and MaxPerIP must be positive")
 	}
 	if dir := filepath.Dir(cfg.HostKeyPath); dir != "" {
 		if err := os.MkdirAll(dir, 0o700); err != nil {

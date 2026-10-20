@@ -34,8 +34,37 @@ const (
 	acceptXML  = "application/xml, text/xml;q=0.9, */*;q=0.1"
 )
 
-// Feed paths tried when the homepage doesn't link a feed.
-var fallbackFeeds = []string{"/feed.json", "/feed.xml", "/atom.xml", "/rss.xml", "/index.xml", "/feed"}
+// Feed paths tried after the feeds the homepage links, relative to the site's
+// path and then to the root.
+var fallbackFeeds = []string{"feed.json", "feed.xml", "atom.xml", "rss.xml", "index.xml", "feed"}
+
+// DefaultMaxEntries is how many posts and pages a site keeps unless
+// configured otherwise.
+const DefaultMaxEntries = 200
+
+// scope is the directory the site lives in: "/" for a whole domain, or
+// "/blog/" when the site URL is example.com/blog.
+func (d *Discoverer) scope() string {
+	p := d.Base.Path
+	if !strings.HasSuffix(p, "/") {
+		p += "/"
+	}
+	return p
+}
+
+// atScopes resolves name under the site's directory and then under the root.
+func (d *Discoverer) atScopes(name string) []string {
+	out := []string{d.Base.ResolveReference(&url.URL{Path: d.scope() + name}).String()}
+	if d.scope() != "/" {
+		out = append(out, d.Base.ResolveReference(&url.URL{Path: "/" + name}).String())
+	}
+	return out
+}
+
+// inScope reports whether u is inside the site's directory.
+func inScope(u *url.URL, scope string) bool {
+	return scope == "/" || strings.HasPrefix(u.Path, scope) || u.Path+"/" == scope
+}
 
 // Discoverer builds a Site for one origin.
 type Discoverer struct {
@@ -60,8 +89,11 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 	}
 	maxEntries := d.MaxEntries
 	if maxEntries <= 0 {
-		maxEntries = 200
+		maxEntries = DefaultMaxEntries
 	}
+	d.Client.StartRound()
+	defer d.Client.EndRound()
+	scope := d.scope()
 
 	sitemaps, err := d.Client.LoadRobots(ctx, d.Base)
 	if err != nil {
@@ -111,7 +143,7 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 				break
 			}
 			key := normalize(p.loc)
-			if seen[key] || !d.Client.Allowed(p.loc) || !readablePath(p.loc.Path) {
+			if seen[key] || !inScope(p.loc, scope) || !d.Client.Allowed(p.loc) || !readablePath(p.loc.Path) {
 				continue
 			}
 			seen[key] = true
@@ -183,8 +215,10 @@ func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []string, p
 	// ones are broken.
 	candidates := sortFeeds(links)
 	for _, p := range fallbackFeeds {
-		if c := d.Base.ResolveReference(&url.URL{Path: p}).String(); !slices.Contains(candidates, c) {
-			candidates = append(candidates, c)
+		for _, c := range d.atScopes(p) {
+			if !slices.Contains(candidates, c) {
+				candidates = append(candidates, c)
+			}
 		}
 	}
 	parser := gofeed.NewParser()
@@ -199,7 +233,7 @@ func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []string, p
 			log.Debug("feed", "url", raw, "err", err)
 			continue
 		}
-		if res.NotModified {
+		if res.NotModified && prev != nil {
 			src := prev.feedEntries
 			if src == nil {
 				for _, e := range prev.Entries {
@@ -339,7 +373,7 @@ func (d *Discoverer) fillBody(ctx context.Context, e *Entry, old *Entry) error {
 	if err != nil {
 		return err
 	}
-	if res.NotModified {
+	if res.NotModified && old != nil {
 		e.Body, e.Kind, e.pageBody = old.Body, old.Kind, true
 		if e.Title == "" {
 			e.Title = old.Title
@@ -347,7 +381,9 @@ func (d *Discoverer) fillBody(ctx context.Context, e *Entry, old *Entry) error {
 		if e.Summary == "" {
 			e.Summary = old.Summary
 		}
-		if e.Date.IsZero() || old.Kind == Post {
+		// Keep the feed's date, as a 200 would. Pages take the date the
+		// article metadata gave last time.
+		if e.Date.IsZero() || (old.Kind == Post && !e.fromFeed) {
 			e.Date = old.Date
 		}
 		return nil
@@ -426,7 +462,7 @@ func (d *Discoverer) loadSitemaps(ctx context.Context, roots []string, log *slog
 		}
 	}
 	if len(queue) == 0 {
-		queue = []string{d.Base.ResolveReference(&url.URL{Path: "/sitemap.xml"}).String()}
+		queue = d.atScopes("sitemap.xml")
 	}
 	visited := map[string]bool{}
 	var out []sitemapURL
@@ -554,7 +590,7 @@ func sortFeeds(links []string) []string {
 		}
 		return 2
 	}
-	out := append([]string(nil), links...)
+	out := slices.Clone(links)
 	sort.SliceStable(out, func(i, j int) bool { return rank(out[i]) < rank(out[j]) })
 	return out
 }

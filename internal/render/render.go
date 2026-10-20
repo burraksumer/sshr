@@ -56,7 +56,7 @@ func Markdown(md string, opts Options) (Document, error) {
 		goldmark.WithExtensions(extension.GFM, extension.DefinitionList),
 		goldmark.WithParserOptions(parser.WithAutoHeadingID()),
 	)
-	source := []byte(md)
+	source := escapeControlRefs(gm.Parser(), []byte(md))
 	doc := gm.Parser().Parse(text.NewReader(source))
 
 	var links []Link
