@@ -187,7 +187,9 @@ func (c Config) Hosts(site *url.URL) []string {
 		hosts = append(hosts, withPort("www."+h))
 	}
 	for _, a := range c.AllowedHosts {
-		hosts = append(hosts, strings.ToLower(strings.TrimSpace(a)))
+		// ParseHost normalizes entries. Lowercasing here first would turn
+		// İ into a plain i and allow a different domain.
+		hosts = append(hosts, strings.TrimSpace(a))
 	}
 	return hosts
 }

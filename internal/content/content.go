@@ -31,6 +31,9 @@ type Entry struct {
 	// fetchedAt is when the page was last fetched or confirmed unchanged.
 	fetchedAt time.Time
 	bodyHash  uint64
+	// stale counts refreshes in a row that kept this copy because the page
+	// couldn't be read.
+	stale int
 }
 
 // renderID identifies an entry's content across refreshes.

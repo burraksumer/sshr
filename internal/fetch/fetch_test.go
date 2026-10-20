@@ -410,3 +410,14 @@ func TestDottedCapitalINotAllowed(t *testing.T) {
 		t.Errorf("asciiHost = %q", got)
 	}
 }
+
+// Robots rules are stored under the host they came from, so a host with İ
+// can't lend its robots.txt to the ASCII host it lowercases to.
+func TestRobotsOriginUsesDialedHost(t *testing.T) {
+	if got := origin(mustURL(t, "http://xİ.example/a")); got == "http://xi.example" {
+		t.Errorf("origin = %q, the lowercased host", got)
+	}
+	if got := origin(mustURL(t, "https://Bücher.de/x")); got != "https://xn--bcher-kva.de" {
+		t.Errorf("origin = %q", got)
+	}
+}

@@ -108,3 +108,15 @@ func TestHostsNoWWWForIPv6(t *testing.T) {
 		t.Errorf("Hosts = %v, want just the address", got)
 	}
 }
+
+// An allowed_hosts entry with İ allowlists its own punycode form, not the
+// ASCII host that lowercasing would give.
+func TestAllowedHostsNotLowercasedFirst(t *testing.T) {
+	c := Config{AllowedHosts: []string{"İstanbul.example"}}
+	u, _ := ParseSiteURL("example.com")
+	for _, h := range c.Hosts(u) {
+		if h == "istanbul.example" {
+			t.Errorf("Hosts = %v, includes the lowercased form", c.Hosts(u))
+		}
+	}
+}

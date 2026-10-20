@@ -1085,3 +1085,92 @@ func TestHomepageConditional(t *testing.T) {
 		t.Errorf("304s %d, title %q, post found %v", home304.Load(), site.Title, site.Lookup(srv.URL+"/p") != nil)
 	}
 }
+
+// A sitemap in ISO-8859-9, as Turkish sites may send, is read.
+func TestSitemapCharset(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/sitemap.xml", func(w http.ResponseWriter, r *http.Request) {
+		w.Write(append([]byte(`<?xml version="1.0" encoding="ISO-8859-9"?><urlset><url><loc>/`), append([]byte{0xE7, 'a', 'y'}, []byte(`</loc></url></urlset>`)...)...))
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/markdown")
+		w.Write([]byte("Tea\n"))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	base, _ := url.Parse(srv.URL + "/")
+	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Host}, Rate: 1000, Burst: 100}), Base: base}
+	site, err := d.Discover(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if site.Lookup(srv.URL+"/%C3%A7ay") == nil {
+		t.Errorf("page from an ISO-8859-9 sitemap missing, entries: %d", len(site.Entries))
+	}
+}
+
+func TestFrontMatterEdgeCases(t *testing.T) {
+	if _, date, _ := frontMatter("---\ndate: 2022-03-01 12:00:00 +0300\n---\nx\n"); parseDate(date).IsZero() {
+		t.Error("Jekyll date not parsed")
+	}
+	md := "---\nIntro: some text that is a paragraph\nand more of it\n---\nRest\n"
+	if _, _, body := frontMatter(md); body != md {
+		t.Errorf("thematic breaks taken as front matter: %q", body)
+	}
+}
+
+// A page that keeps answering with something unreadable loses its old copy
+// after maxStale refreshes.
+func TestStaleCopyExpires(t *testing.T) {
+	var broken atomic.Bool
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("/feed.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/feed+json")
+		w.Write([]byte(`{"version":"https://jsonfeed.org/version/1.1","items":[{"id":"1","url":"` + srv.URL + `/p","title":"P","summary":"s"},{"id":"2","url":"` + srv.URL + `/q","title":"Q","content_text":"q"}]}`))
+	})
+	mux.HandleFunc("/p", func(w http.ResponseWriter, r *http.Request) {
+		if broken.Load() {
+			w.Header().Set("Content-Type", "application/pdf")
+			w.Write([]byte("%PDF"))
+			return
+		}
+		w.Header().Set("Content-Type", "text/markdown")
+		w.Write([]byte("Body\n"))
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+	base, _ := url.Parse(srv.URL + "/")
+	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Host}, Rate: 1000, Burst: 100}), Base: base}
+	site, err := d.Discover(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	broken.Store(true)
+	for i := 0; i <= maxStale; i++ {
+		if site, err = d.Discover(context.Background(), site, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if site.Lookup(srv.URL+"/p") != nil {
+		t.Error("unreadable page kept forever")
+	}
+}
+
+func TestCancelledRefreshFails(t *testing.T) {
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("/feed.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/feed+json")
+		w.Write([]byte(`{"version":"https://jsonfeed.org/version/1.1","items":[{"id":"1","url":"` + srv.URL + `/p","title":"P","summary":"s"}]}`))
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+	base, _ := url.Parse(srv.URL + "/")
+	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Host}, Rate: 1000, Burst: 100}), Base: base}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := d.Discover(ctx, nil, nil); err == nil {
+		t.Error("cancelled refresh reported success")
+	}
+}

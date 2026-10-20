@@ -27,6 +27,7 @@ import (
 	"github.com/burraksumer/sshr/internal/sanitize"
 	"github.com/mmcdole/gofeed"
 	"golang.org/x/net/html"
+	"golang.org/x/net/html/charset"
 )
 
 const (
@@ -55,6 +56,10 @@ func capBody(s string) string {
 	}
 	return strings.ToValidUTF8(cut, "") + "\n\n*This entry was cut short because it is very long.*\n"
 }
+
+// maxStale is how many refreshes in a row a copy is kept for a page that
+// answers but can't be read.
+const maxStale = 8
 
 // DefaultPageBudget is how long a refresh spends fetching pages unless
 // configured otherwise. With a long Crawl-delay, the rest come in later
@@ -86,9 +91,9 @@ func (d *Discoverer) scope() string {
 }
 
 // atScopes resolves name under the site's directory and then under the root.
-func (d *Discoverer) atScopes(name string) []string {
-	out := []string{d.Base.ResolveReference(&url.URL{Path: d.scope() + name}).String()}
-	if d.scope() != "/" {
+func (d *Discoverer) atScopes(scope, name string) []string {
+	out := []string{d.Base.ResolveReference(&url.URL{Path: scope + name}).String()}
+	if scope != "/" {
 		out = append(out, d.Base.ResolveReference(&url.URL{Path: "/" + name}).String())
 	}
 	return out
@@ -174,7 +179,7 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 	}
 
 	// Feeds give posts with dates and, often, full content.
-	entries, feedURL := d.loadFeed(ctx, site, feedLinks, prev, log)
+	entries, feedURL := d.loadFeed(ctx, site, feedLinks, prev, scope, log)
 	site.feedURL = feedURL
 	// Some feeds list oldest first. Keep the newest posts when cutting.
 	sort.SliceStable(entries, func(i, j int) bool {
@@ -246,6 +251,10 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 	}
 
 	d.fillBodies(ctx, entries, prev, log)
+	// An interrupted refresh would publish a cut-down snapshot.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	site.feedEntries = feedEntries
 	// Anything kept from last round without a request keeps its
 	// validators: pages, sitemaps and the feed.
@@ -301,7 +310,7 @@ func finish(site *Site, kept []*Entry) *Site {
 
 // loadFeed tries feed candidates in order and returns the entries of the first
 // one that parses with at least one item.
-func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []feedLink, prev *Site, log *slog.Logger) ([]*Entry, string) {
+func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []feedLink, prev *Site, scope string, log *slog.Logger) ([]*Entry, string) {
 	// Advertised feeds first, then the common paths, in case the advertised
 	// ones are broken.
 	candidates := sortFeeds(links)
@@ -315,7 +324,7 @@ func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []feedLink,
 	// every refresh, only every reprobeEvery refreshes.
 	if prev == nil || prev.feedURL != "" || prev.probeAge >= reprobeEvery {
 		for _, p := range fallbackFeeds {
-			for _, c := range d.atScopes(p) {
+			for _, c := range d.atScopes(scope, p) {
 				if !slices.Contains(candidates, c) {
 					candidates = append(candidates, c)
 				}
@@ -361,7 +370,6 @@ func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []feedLink,
 		if len(feed.Items) == 0 {
 			continue
 		}
-		scope := d.scope()
 		entries := make([]*Entry, 0, len(feed.Items))
 		seenItem := map[string]bool{}
 		for _, item := range feed.Items {
@@ -587,8 +595,11 @@ func (d *Discoverer) fillBody(ctx context.Context, e *Entry, old *Entry) error {
 		return fmt.Errorf("status %d", res.Status)
 	}
 	if err := d.readPage(e, res); err != nil {
-		if hasOld {
+		// The page answered but couldn't be read, which may not get
+		// better. Keep the old copy for a few refreshes, not forever.
+		if hasOld && old.stale < maxStale {
 			reuse(e, old)
+			e.stale = old.stale + 1
 			return fmt.Errorf("kept previous copy: %w", err)
 		}
 		return err
@@ -721,7 +732,7 @@ func (d *Discoverer) loadSitemaps(ctx context.Context, roots []string, prev *Sit
 		}
 	}
 	if len(queue) == 0 {
-		queue = d.atScopes("sitemap.xml")
+		queue = d.atScopes(scope, "sitemap.xml")
 	}
 	visited := map[string]bool{}
 	cache := map[string]cachedSitemap{}
@@ -756,7 +767,10 @@ func (d *Discoverer) loadSitemaps(ctx context.Context, roots []string, prev *Sit
 			continue
 		default:
 			var doc sitemapDoc
-			err := xml.Unmarshal(res.Body, &doc)
+			// Sitemaps may declare another encoding, like ISO-8859-9.
+			dec := xml.NewDecoder(bytes.NewReader(res.Body))
+			dec.CharsetReader = charset.NewReaderLabel
+			err := dec.Decode(&doc)
 			isSitemap := err == nil && (doc.XMLName.Local == "urlset" || doc.XMLName.Local == "sitemapindex")
 			switch {
 			case isSitemap:
@@ -979,7 +993,7 @@ func frontMatter(md string) (title, date, body string) {
 		return "", "", md
 	}
 	head, body, ok := strings.Cut(rest, "\n---\n")
-	if !ok {
+	if !ok || !looksLikeYAML(head) {
 		return "", "", md
 	}
 	for line := range strings.SplitSeq(head, "\n") {
@@ -996,6 +1010,25 @@ func frontMatter(md string) (title, date, body string) {
 		}
 	}
 	return title, date, body
+}
+
+var yamlKey = regexp.MustCompile(`^[A-Za-z_][\w-]*:(\s|$)`)
+
+// looksLikeYAML reports whether every line of head is a YAML key, a list
+// item or an indented continuation, so a page that opens with a thematic
+// break isn't mistaken for front matter.
+func looksLikeYAML(head string) bool {
+	keys := 0
+	for line := range strings.SplitSeq(head, "\n") {
+		switch {
+		case strings.TrimSpace(line) == "", strings.HasPrefix(line, " "), strings.HasPrefix(line, "- "), strings.HasPrefix(line, "#"):
+		case yamlKey.MatchString(line):
+			keys++
+		default:
+			return false
+		}
+	}
+	return keys > 0
 }
 
 func firstHeading(md string) string {
@@ -1049,7 +1082,12 @@ var pageExts = map[string]bool{".html": true, ".htm": true, ".php": true, ".md":
 
 func parseDate(s string) time.Time {
 	s = strings.TrimSpace(s)
-	for _, layout := range []string{time.RFC3339, "2006-01-02T15:04Z07:00", "2006-01-02"} {
+	for _, layout := range []string{
+		time.RFC3339, "2006-01-02T15:04Z07:00", "2006-01-02",
+		// Jekyll and Hugo front matter.
+		"2006-01-02 15:04:05 -0700", "2006-01-02 15:04:05", "2006-01-02 15:04",
+		time.RFC1123Z, time.RFC1123,
+	} {
 		if t, err := time.Parse(layout, s); err == nil {
 			return t
 		}

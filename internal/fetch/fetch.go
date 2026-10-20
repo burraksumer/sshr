@@ -174,16 +174,24 @@ func (c *Client) StartRound() {
 // Keep marks validators for rawURL as used this round, for URLs whose
 // earlier copy is kept without a request, so EndRound doesn't drop them.
 func (c *Client) Keep(rawURL string) {
+	if u, err := url.Parse(rawURL); err == nil {
+		c.touch(asciiHost(u).String())
+	}
+}
+
+// touch marks the validators and remembered redirect for key, a URL in
+// asciiHost form, as used this round.
+func (c *Client) touch(key string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if m, ok := c.moved[rawURL]; ok {
+	if m, ok := c.moved[key]; ok {
 		m.round = c.round
-		c.moved[rawURL] = m
-		rawURL = m.to
+		c.moved[key] = m
+		key = m.to
 	}
-	if v, ok := c.validators[rawURL]; ok {
+	if v, ok := c.validators[key]; ok {
 		v.round = c.round
-		c.validators[rawURL] = v
+		c.validators[key] = v
 	}
 }
 
@@ -297,7 +305,9 @@ func asciiHost(u *url.URL) *url.URL {
 
 // origin identifies whose robots.txt applies to u.
 func origin(u *url.URL) string {
-	return strings.ToLower(u.Scheme + "://" + u.Host)
+	// The dialed form, so rules are stored under the host they came from.
+	a := asciiHost(u)
+	return strings.ToLower(a.Scheme) + "://" + a.Host
 }
 
 // robotsFor returns the robots.txt rules for u's origin, fetching them once
@@ -414,7 +424,11 @@ func (c *Client) GetLarge(ctx context.Context, u *url.URL, accept string, condit
 func (c *Client) get(ctx context.Context, u *url.URL, accept string, conditional, checkRobots bool, maxBytes int64) (*Response, error) {
 	// A URL that moved permanently is asked for at its new place, so a
 	// conditional request can get a 304 instead of a redirect.
-	start := u.String()
+	// Keys use the asciiHost form, the same one do stores validators under.
+	start := asciiHost(u).String()
+	// A URL that was asked for keeps its validators, even if the request
+	// fails before it is sent, like during a robots.txt outage.
+	c.touch(start)
 	if conditional {
 		c.mu.Lock()
 		m, ok := c.moved[start]
@@ -432,7 +446,10 @@ func (c *Client) get(ctx context.Context, u *url.URL, accept string, conditional
 				return res, nil
 			}
 			c.mu.Lock()
-			delete(c.moved, start)
+			// Unless following it just recorded a newer permanent target.
+			if now, ok := c.moved[start]; ok && now.to == m.to {
+				delete(c.moved, start)
+			}
 			c.mu.Unlock()
 			if err == nil && (res.Status == http.StatusNotFound || res.Status == http.StatusGone) {
 				return c.follow(ctx, u, start, accept, conditional, checkRobots, maxBytes)
