@@ -165,6 +165,7 @@ func ParseSiteURL(raw string) (*url.URL, error) {
 	if u.Path == "" {
 		u.Path = "/"
 	}
+	u.Fragment, u.RawFragment = "", ""
 	if fetch.HostKey(u.Hostname()) == "" {
 		return nil, fmt.Errorf("site URL host %q is not a valid host name", u.Hostname())
 	}

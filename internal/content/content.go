@@ -40,12 +40,23 @@ type Entry struct {
 	// base is the URL the page was read from after redirects, which its
 	// relative links resolve against.
 	base string
+	// textKey identifies a text-only entry, which has no URL.
+	textKey string
 }
 
 // renderID identifies an entry's content across refreshes.
 type renderID struct {
 	url  string
 	hash uint64
+}
+
+// Key identifies the entry within a site across refreshes: its URL, or for
+// a text-only feed item, its GUID, title and date.
+func (e *Entry) Key() string {
+	if e.URL != "" {
+		return e.URL
+	}
+	return e.textKey
 }
 
 // BaseURL is what the entry's links resolve against: the page's final URL
@@ -60,7 +71,7 @@ func (e *Entry) BaseURL() string {
 // RenderID is a comparable key for caching renders of the entry. It stays
 // the same across refreshes while the URL and body don't change.
 func (e *Entry) RenderID() any {
-	return renderID{e.URL, e.bodyHash}
+	return renderID{e.Key(), e.bodyHash}
 }
 
 // Site is an immutable snapshot of a website's content. Sessions share it and
@@ -101,6 +112,10 @@ func (s *Site) Lookup(rawURL string) *Entry {
 func (s *Site) index() {
 	s.byURL = make(map[string]*Entry, len(s.Entries))
 	for _, e := range s.Entries {
+		// Text-only entries have no URL to be found by.
+		if e.URL == "" {
+			continue
+		}
 		if k, ok := key(e.URL); ok {
 			s.byURL[k] = e
 		}

@@ -66,7 +66,7 @@ type Model struct {
 func New(store *content.Store) Model {
 	ti := textinput.New()
 	ti.Prompt = "/"
-	ti.Placeholder = "search titles and tags"
+	ti.Placeholder = "search titles, summaries and tags"
 	// ctrl+v reads the clipboard of the machine sshr runs on, which over SSH
 	// is the server. Terminal paste still works through bracketed paste.
 	ti.KeyMap.Paste.SetEnabled(false)
@@ -132,12 +132,12 @@ func (m *Model) syncSite() {
 	}
 	var selected string
 	if m.cursor < len(m.visible) {
-		selected = m.visible[m.cursor].URL
+		selected = m.visible[m.cursor].Key()
 	}
 	m.site = site
 	m.applyFilter()
 	for i, e := range m.visible {
-		if selected != "" && e.URL == selected {
+		if selected != "" && e.Key() == selected {
 			m.cursor = i
 			m.clampOffset()
 			break
@@ -529,7 +529,12 @@ func readingPosition(vp viewport.Model) float64 {
 
 func entryMeta(e *content.Entry) string {
 	var parts []string
-	if !e.Date.IsZero() {
+	switch {
+	case e.Date.IsZero():
+	case e.Kind == content.Page:
+		// A page's date is when it last changed, from the sitemap.
+		parts = append(parts, "Updated "+e.Date.Format("January 2, 2006"))
+	default:
 		parts = append(parts, e.Date.Format("January 2, 2006"))
 	}
 	if len(e.Tags) > 0 {

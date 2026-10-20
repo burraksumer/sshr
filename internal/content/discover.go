@@ -361,6 +361,11 @@ func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []feedLink,
 	parser := gofeed.NewParser()
 	prevFailed, garbage := false, false
 	for _, raw := range candidates {
+		// When last round's feed fails for a moment, keep its entries
+		// rather than taking a lesser feed, like the comments feed.
+		if prevFailed && prev.feedEntries != nil {
+			break
+		}
 		u, err := url.Parse(raw)
 		if err != nil {
 			continue
@@ -398,20 +403,28 @@ func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []feedLink,
 			continue
 		}
 		entries := make([]*Entry, 0, len(feed.Items))
-		seenItem, seenGUID := map[string]bool{}, map[string]bool{}
+		// Items are told apart by link and GUID together. Several items
+		// can share one link, often the homepage, each with its own GUID
+		// and text, as changelogs and microblogs do. Those are kept as
+		// text-only entries. The same link and GUID, or the same link
+		// with a GUID missing, is one post listed twice, and a feed that
+		// gives every item one GUID still has distinct posts.
+		seenLink, seenGUID := map[string]map[string]bool{}, map[string]bool{}
 		for _, item := range feed.Items {
 			e := entryFromItem(item, res.URL)
 			if e == nil {
 				continue
 			}
-			guid := strings.TrimSpace(item.GUID)
-			if guid != "" {
-				if seenGUID[guid] {
-					continue
+			g := guidKey(item.GUID, res.URL)
+			textOnly := false
+			if e.URL == "" {
+				if g != "" {
+					if seenGUID[g] {
+						continue
+					}
+					seenGUID[g] = true
 				}
-				seenGUID[guid] = true
-			}
-			if e.URL != "" {
+			} else {
 				// A site-wide feed found from a /blog site only counts
 				// for its /blog posts.
 				u, err := url.Parse(e.URL)
@@ -419,26 +432,29 @@ func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []feedLink,
 					continue
 				}
 				k := normalize(u)
-				switch {
-				case d.isHome(k), seenItem[k] && guid != "":
-					// Several items can share one link, often the
-					// homepage, each with its own text, as changelogs
-					// and microblogs do. Keep those as text-only entries.
-					if strings.TrimSpace(e.Body) == "" {
-						continue
-					}
-					e.URL = ""
-				case seenItem[k]:
-					// The same post listed twice, or under both www and
-					// bare hosts. The first wins.
+				switch guids := seenLink[k]; {
+				case guids == nil:
+					seenLink[k] = map[string]bool{g: true}
+					textOnly = d.isHome(k)
+				case g == "" || guids[g] || guids[""]:
 					continue
 				default:
-					seenItem[k] = true
+					guids[g] = true
+					textOnly = true
 				}
 			}
-			// Text-only items can't be placed in a scoped site's path.
-			if e.URL == "" && scope != "/" {
-				continue
+			if textOnly {
+				if strings.TrimSpace(e.Body) == "" {
+					continue
+				}
+				e.URL = ""
+			}
+			if e.URL == "" {
+				// Text-only items can't be placed in a scoped site's path.
+				if scope != "/" {
+					continue
+				}
+				e.textKey = "text:" + g + "|" + e.Title + "|" + e.Date.String()
 			}
 			entries = append(entries, e)
 		}
@@ -581,8 +597,7 @@ func (d *Discoverer) fillBodies(ctx context.Context, entries []*Entry, prev *Sit
 	}
 	sort.SliceStable(todo, func(i, j int) bool {
 		a, b := olds[todo[i]], olds[todo[j]]
-		switch {
-		case a == nil || b == nil:
+		if a == nil || b == nil {
 			return a == nil && b != nil
 		}
 		return a.fetchedAt.Before(b.fetchedAt)
@@ -715,7 +730,9 @@ func (d *Discoverer) homeDir() string {
 // homeKeys computes the homepage keys once, since Base doesn't change.
 func (d *Discoverer) homeKeys() (base, dir string) {
 	d.homeOnce.Do(func() {
-		d.homeBase = normalize(d.Base)
+		b := *d.Base
+		b.RawQuery = ""
+		d.homeBase = normalize(&b)
 		d.homeDirKey = normalize(d.Base.ResolveReference(&url.URL{Path: d.scope()}))
 	})
 	return d.homeBase, d.homeDirKey
@@ -779,6 +796,19 @@ func (d *Discoverer) readPage(e *Entry, res *fetch.Response) error {
 		applyPublished(e, t)
 	}
 	return nil
+}
+
+// guidKey is a GUID in comparable form. A GUID that is a link, as many
+// generators use the permalink, normalizes like one, so www and bare host
+// forms match.
+func guidKey(guid string, feedURL *url.URL) string {
+	guid = strings.TrimSpace(guid)
+	if strings.HasPrefix(guid, "http://") || strings.HasPrefix(guid, "https://") {
+		if u, err := feedURL.Parse(guid); err == nil {
+			return normalize(u)
+		}
+	}
+	return guid
 }
 
 // applyPublished records a published date found on a page. It makes the
@@ -951,7 +981,7 @@ type headMeta struct {
 
 // feedLink is a feed advertised in a page's head.
 type feedLink struct {
-	href, typ string
+	href, typ, title string
 }
 
 // parseHead reads <title>, the description and feed links from an HTML head.
@@ -1000,7 +1030,7 @@ func parseHead(body []byte) headMeta {
 			case "link":
 				rels := strings.Fields(strings.ToLower(attrs["rel"]))
 				if slices.Contains(rels, "alternate") && isFeedType(attrs["type"]) && attrs["href"] != "" {
-					m.feeds = append(m.feeds, feedLink{href: attrs["href"], typ: strings.ToLower(strings.TrimSpace(attrs["type"]))})
+					m.feeds = append(m.feeds, feedLink{href: attrs["href"], typ: strings.ToLower(strings.TrimSpace(attrs["type"])), title: attrs["title"]})
 				}
 			}
 		}
@@ -1038,8 +1068,16 @@ func sortFeeds(links []feedLink) []string {
 		}
 		return 2
 	}
+	// Comment feeds, which WordPress advertises next to the post feed,
+	// come after every other feed.
+	score := func(l feedLink) int {
+		if strings.Contains(strings.ToLower(l.href), "/comments/") || strings.Contains(strings.ToLower(l.title), "comments") {
+			return 10 + rank(l.typ)
+		}
+		return rank(l.typ)
+	}
 	sorted := slices.Clone(links)
-	sort.SliceStable(sorted, func(i, j int) bool { return rank(sorted[i].typ) < rank(sorted[j].typ) })
+	sort.SliceStable(sorted, func(i, j int) bool { return score(sorted[i]) < score(sorted[j]) })
 	out := make([]string, len(sorted))
 	for i, l := range sorted {
 		out[i] = l.href

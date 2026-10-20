@@ -47,13 +47,17 @@ func (s *Store) Refresh(ctx context.Context) error {
 		s.mu.Unlock()
 	})
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.err = err
+	if err == nil {
+		s.site = site
+	}
+	s.mu.Unlock()
+	// Logging happens outside the lock, so a slow log writer can't stall
+	// sessions reading the store.
 	if err != nil {
 		s.log.Error("refresh failed", "url", s.disc.Base.String(), "err", err)
 		return err
 	}
-	s.site = site
 	s.log.Info("refreshed", "url", site.URL, "entries", len(site.Entries), "took", time.Since(start).Round(time.Millisecond))
 	return nil
 }

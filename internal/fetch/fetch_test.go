@@ -487,3 +487,19 @@ func TestRobotsBadRedirectAllows(t *testing.T) {
 		t.Errorf("page blocked: %v", err)
 	}
 }
+
+// A big error page is a passing outage, not a permanent failure.
+func TestLargeErrorPageNotPermanent(t *testing.T) {
+	srv, c := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/robots.txt" {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte(strings.Repeat("x", 6<<20)))
+	})
+	res, err := c.Get(context.Background(), mustURL(t, srv.URL+"/"), "", false)
+	if err != nil || res.Status != http.StatusServiceUnavailable {
+		t.Errorf("got %v, %v; want a 503 response", res, err)
+	}
+}

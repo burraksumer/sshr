@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -321,8 +322,8 @@ func TestSubpathScope(t *testing.T) {
 // A page that answers 304 keeps the feed's date, and a server that answers
 // 304 without being asked doesn't crash discovery.
 func TestSortFeedsJSONLast(t *testing.T) {
-	got := sortFeeds([]feedLink{{"/api", "application/json"}, {"/rss", "application/rss+xml"}, {"/atom", "application/atom+xml"}, {"/jf", "application/feed+json"}})
-	if strings.Join(got, ",") != "/jf,/atom,/rss,/api" {
+	got := sortFeeds([]feedLink{{href: "/api", typ: "application/json"}, {href: "/rss", typ: "application/rss+xml"}, {href: "/atom", typ: "application/atom+xml"}, {href: "/jf", typ: "application/feed+json"}, {href: "/comments/feed/", typ: "application/rss+xml"}})
+	if strings.Join(got, ",") != "/jf,/atom,/rss,/api,/comments/feed/" {
 		t.Errorf("sortFeeds = %v", got)
 	}
 }
@@ -1348,5 +1349,76 @@ func TestItemsSharingALink(t *testing.T) {
 	}
 	if len(site.Entries) != 2 {
 		t.Errorf("got %d entries, want both releases", len(site.Entries))
+	}
+}
+
+// A feed that gives every item one GUID still has distinct posts, and the
+// same post under www and bare hosts with permalink GUIDs is one post.
+func TestFeedIdentity(t *testing.T) {
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("/feed.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/feed+json")
+		w.Write([]byte(`{"version":"https://jsonfeed.org/version/1.1","items":[
+{"id":"` + srv.URL + `/","url":"` + srv.URL + `/a","title":"A","content_text":"a"},
+{"id":"` + srv.URL + `/","url":"` + srv.URL + `/b","title":"B","content_text":"b"},
+{"id":"` + srv.URL + `/c/","url":"` + srv.URL + `/c/","title":"C","content_text":"c"},
+{"id":"` + strings.Replace(srv.URL, "127.0.0.1", "127.0.0.1", 1) + `/c","url":"` + srv.URL + `/c","title":"C again","content_text":"c"}]}`))
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+	base, _ := url.Parse(srv.URL + "/")
+	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Host}, Rate: 1000, Burst: 100}), Base: base}
+	site, err := d.Discover(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var titles []string
+	for _, e := range site.Entries {
+		titles = append(titles, e.Title)
+	}
+	sort.Strings(titles)
+	if strings.Join(titles, ",") != "A,B,C" {
+		t.Errorf("entries = %v, want A, B and C once", titles)
+	}
+}
+
+// When last round's feed fails for a moment, its entries stay instead of
+// the comments feed taking over.
+func TestFeedOutageDoesNotFallToComments(t *testing.T) {
+	var down atomic.Bool
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("/{$}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<html><head>
+<link rel="alternate" type="application/rss+xml" title="Site feed" href="/feed/">
+<link rel="alternate" type="application/rss+xml" title="Site comments feed" href="/comments/feed/"></head></html>`))
+	})
+	rss := func(title string) string {
+		return `<?xml version="1.0"?><rss version="2.0"><channel><item><title>` + title + `</title><link>` + srv.URL + `/` + strings.ReplaceAll(title, " ", "-") + `</link><content:encoded xmlns:content="http://purl.org/rss/1.0/modules/content/">x</content:encoded></item></channel></rss>`
+	}
+	mux.HandleFunc("/feed/", func(w http.ResponseWriter, r *http.Request) {
+		if down.Load() {
+			http.Error(w, "busy", http.StatusServiceUnavailable)
+			return
+		}
+		w.Write([]byte(rss("Real post")))
+	})
+	mux.HandleFunc("/comments/feed/", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(rss("Comment on Real post"))) })
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+	base, _ := url.Parse(srv.URL + "/")
+	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Host}, Rate: 1000, Burst: 100}), Base: base}
+	site, err := d.Discover(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	down.Store(true)
+	if site, err = d.Discover(context.Background(), site, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(site.Entries) != 1 || site.Entries[0].Title != "Real post" {
+		t.Errorf("entries during the outage: %v", site.Entries[0].Title)
 	}
 }

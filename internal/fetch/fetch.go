@@ -689,6 +689,12 @@ func (c *Client) do(ctx context.Context, u *url.URL, accept string, conditional,
 	}
 
 	out := &Response{URL: u, Status: res.StatusCode}
+	// Callers only read successful bodies. An error page is read briefly so
+	// the connection can be reused, and its size isn't held against it.
+	if res.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, 64<<10))
+		return out, nil, res.StatusCode, nil
+	}
 	if mt, _, err := mime.ParseMediaType(res.Header.Get("Content-Type")); err == nil {
 		out.ContentType = strings.ToLower(mt)
 	}
