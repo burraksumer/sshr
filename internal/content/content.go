@@ -30,6 +30,19 @@ type Entry struct {
 	fromFeed bool
 	// fetchedAt is when the page was last fetched or confirmed unchanged.
 	fetchedAt time.Time
+	bodyHash  uint64
+}
+
+// renderID identifies an entry's content across refreshes.
+type renderID struct {
+	url  string
+	hash uint64
+}
+
+// RenderID is a comparable key for caching renders of the entry. It stays
+// the same across refreshes while the URL and body don't change.
+func (e *Entry) RenderID() any {
+	return renderID{e.URL, e.bodyHash}
 }
 
 // Site is an immutable snapshot of a website's content. Sessions share it and

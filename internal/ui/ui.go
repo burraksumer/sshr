@@ -213,6 +213,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 
+	case tea.PasteMsg:
+		// Terminal paste into the search box.
+		if m.screen == screenList && m.filtering {
+			var cmd tea.Cmd
+			m.filter, cmd = m.filter.Update(msg)
+			m.applyFilter()
+			return m, cmd
+		}
+		return m, nil
+
 	case tea.MouseClickMsg:
 		if m.screen == screenList && msg.Button == tea.MouseLeft {
 			if i := m.rowAt(msg.Y); i >= 0 {
@@ -394,7 +404,7 @@ func (m *Model) renderEntry(top bool) {
 	m.vp.SetWidth(m.width)
 	m.vp.SetHeight(max(m.height-1, 1))
 
-	doc, err := render.Cached(m.entry, m.entry.Body, render.Options{Width: w, Dark: m.dark, BaseURL: m.entry.URL})
+	doc, err := render.Cached(m.entry.RenderID(), m.entry.Body, render.Options{Width: w, Dark: m.dark, BaseURL: m.entry.URL})
 	if err != nil {
 		// The body is sanitized markdown, but render failed, so show it
 		// unstyled rather than nothing.

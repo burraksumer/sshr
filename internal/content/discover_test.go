@@ -1025,3 +1025,25 @@ func TestPostLeavingFeedStaysPost(t *testing.T) {
 		t.Errorf("old post = %+v, want a dated post", e)
 	}
 }
+
+func TestFrontMatter(t *testing.T) {
+	title, date, body := frontMatter("---\ntitle: \"My post\"\ndate: 2024-03-01\ntags: [a]\n---\nBody text\n")
+	if title != "My post" || date != "2024-03-01" || body != "Body text\n" {
+		t.Errorf("got %q %q %q", title, date, body)
+	}
+	if _, _, body := frontMatter("no front matter\n---\n"); body != "no front matter\n---\n" {
+		t.Errorf("body changed: %q", body)
+	}
+}
+
+func TestRenderIDStableAcrossRefreshes(t *testing.T) {
+	a := finish(&Site{}, []*Entry{{URL: "https://x.example/p", Body: "same"}})
+	b := finish(&Site{}, []*Entry{{URL: "https://x.example/p", Body: "same"}})
+	c := finish(&Site{}, []*Entry{{URL: "https://x.example/p", Body: "changed"}})
+	if a.Entries[0].RenderID() != b.Entries[0].RenderID() {
+		t.Error("same content got different render IDs")
+	}
+	if a.Entries[0].RenderID() == c.Entries[0].RenderID() {
+		t.Error("changed body kept its render ID")
+	}
+}

@@ -84,3 +84,16 @@ func TestResizeKeepsTopOfShortPost(t *testing.T) {
 		t.Errorf("offset after resize = %d, want 0", off)
 	}
 }
+
+func TestPasteIntoSearch(t *testing.T) {
+	m := New(content.NewStore(&content.Discoverer{}, nil))
+	m.site = &content.Site{Entries: []*content.Entry{{Title: "golang notes"}, {Title: "other"}}}
+	m.applyFilter()
+	var tm tea.Model = m
+	tm, _ = tm.(Model).Update(key("/"))
+	tm, _ = tm.(Model).Update(tea.PasteMsg{Content: "golang"})
+	got := tm.(Model)
+	if got.filter.Value() != "golang" || len(got.visible) != 1 {
+		t.Errorf("filter %q, %d visible", got.filter.Value(), len(got.visible))
+	}
+}

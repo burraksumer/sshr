@@ -21,6 +21,7 @@ import (
 
 	"github.com/temoto/robotstxt"
 	"golang.org/x/net/html/charset"
+	"golang.org/x/net/idna"
 	"golang.org/x/time/rate"
 )
 
@@ -204,6 +205,16 @@ func (c *Client) EndRound() {
 
 const hostFormat = "should be a host like cdn.example.com or cdn.example.com:8443, without a scheme or path"
 
+// hostKey is the form hosts are compared in: lowercase and, for Unicode
+// names, punycode, so bücher.de and xn--bcher-kva.de match.
+func hostKey(h string) string {
+	h = strings.ToLower(h)
+	if a, err := idna.Lookup.ToASCII(h); err == nil {
+		return a
+	}
+	return h
+}
+
 // ParseHost reads an allowlist entry, "host" or "host:port", and returns the
 // lowercase host and the ports it allows. A bare host allows 80 and 443.
 func ParseHost(h string) (host string, ports []string, err error) {
@@ -218,6 +229,7 @@ func ParseHost(h string) (host string, ports []string, err error) {
 	if host == "" || strings.ContainsAny(host, "/:@?#% ") && net.ParseIP(host) == nil {
 		return "", nil, fmt.Errorf("%q %s", h, hostFormat)
 	}
+	host = hostKey(host)
 	if splitErr != nil {
 		return host, []string{"80", "443"}, nil
 	}
@@ -247,7 +259,7 @@ func (c *Client) checkURL(u *url.URL) error {
 	if port == "" {
 		port = map[string]string{"http": "80", "https": "443"}[u.Scheme]
 	}
-	if !c.hosts[net.JoinHostPort(strings.ToLower(u.Hostname()), port)] {
+	if !c.hosts[net.JoinHostPort(hostKey(u.Hostname()), port)] {
 		return fmt.Errorf("%w: %q", ErrNotAllowed, u.Host)
 	}
 	return nil
@@ -307,7 +319,12 @@ func (c *Client) fetchRobots(ctx context.Context, u *url.URL) (robotsEntry, erro
 			// An unparseable file is treated like a missing one.
 			data, _ = robotstxt.FromStatusAndBytes(http.StatusNotFound, nil)
 		}
-		e.data, e.unavailable = data, resp.Status >= 500
+		// RFC 9309 treats 4xx as "no robots.txt", but a 429 means sshr is
+		// going too fast, so it counts as unavailable, like a 5xx.
+		if resp.Status == http.StatusTooManyRequests {
+			data = disallowAll
+		}
+		e.data, e.unavailable = data, resp.Status >= 500 || resp.Status == http.StatusTooManyRequests
 	}
 	c.mu.Lock()
 	e.round = c.round
@@ -377,15 +394,30 @@ func (c *Client) get(ctx context.Context, u *url.URL, accept string, conditional
 	start := u.String()
 	if conditional {
 		c.mu.Lock()
-		if m, ok := c.moved[start]; ok {
+		m, ok := c.moved[start]
+		if ok {
 			m.round = c.round
 			c.moved[start] = m
-			if to, err := url.Parse(m.to); err == nil {
-				u = to
-			}
 		}
 		c.mu.Unlock()
+		if to, err := url.Parse(m.to); ok && err == nil {
+			res, err := c.follow(ctx, to, start, accept, conditional, checkRobots, maxBytes)
+			// The new place is gone. The old URL may work again.
+			if err == nil && (res.Status == http.StatusNotFound || res.Status == http.StatusGone) {
+				c.mu.Lock()
+				delete(c.moved, start)
+				c.mu.Unlock()
+				return c.follow(ctx, u, start, accept, conditional, checkRobots, maxBytes)
+			}
+			return res, err
+		}
 	}
+	return c.follow(ctx, u, start, accept, conditional, checkRobots, maxBytes)
+}
+
+// follow requests u and follows its redirects. start is the URL the caller
+// asked for, under which a permanent redirect is remembered.
+func (c *Client) follow(ctx context.Context, u *url.URL, start, accept string, conditional, checkRobots bool, maxBytes int64) (*Response, error) {
 	permanent := true
 	// Redirects are followed here rather than by net/http, so every hop gets
 	// the allowlist and robots.txt checks, waits on the rate limiter, and has

@@ -6,6 +6,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -215,7 +216,8 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 				break
 			}
 			// Encoded like feed entry URLs, so the same URL matches.
-			loc, err := url.Parse(sanitize.URL(p.loc.String()))
+			raw := sanitize.URL(p.loc.String())
+			loc, err := url.Parse(raw)
 			if err != nil {
 				continue
 			}
@@ -224,7 +226,7 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 				continue
 			}
 			seen[key] = true
-			entries = append(entries, &Entry{URL: sanitize.URL(p.loc.String()), Kind: Page, Date: p.lastmod})
+			entries = append(entries, &Entry{URL: raw, Kind: Page, Date: p.lastmod})
 			room--
 		}
 	}
@@ -256,6 +258,9 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 // finish sorts entries, fills missing titles and indexes the site.
 func finish(site *Site, kept []*Entry) *Site {
 	for _, e := range kept {
+		h := fnv.New64a()
+		h.Write([]byte(e.Body))
+		e.bodyHash = h.Sum64()
 		if e.Title == "" {
 			// The URL path is percent-decoded and can hold control bytes.
 			e.Title = sanitize.Line(titleFromURL(e.URL))
@@ -599,8 +604,18 @@ func (d *Discoverer) readPage(e *Entry, res *fetch.Response) error {
 	switch res.ContentType {
 	case "text/markdown", "text/x-markdown", "text/plain":
 		body := sanitize.Text(string(res.Body))
+		title, date, body := frontMatter(body)
+		if e.Title == "" {
+			e.Title = title
+		}
 		if e.Title == "" {
 			e.Title = firstHeading(body)
+		}
+		if t := parseDate(date); !t.IsZero() {
+			if e.Date.IsZero() || !e.fromFeed {
+				e.Date = t
+			}
+			e.Kind = Post
 		}
 		e.Body, e.fetchedAt = capBody(body), time.Now()
 		return nil
@@ -935,6 +950,33 @@ func htmlText(s string) string {
 			}
 		}
 	}
+}
+
+// frontMatter splits YAML front matter, as static site generators write it,
+// off a markdown body, and returns its title and date fields.
+func frontMatter(md string) (title, date, body string) {
+	rest, ok := strings.CutPrefix(md, "---\n")
+	if !ok {
+		return "", "", md
+	}
+	head, body, ok := strings.Cut(rest, "\n---\n")
+	if !ok {
+		return "", "", md
+	}
+	for line := range strings.SplitSeq(head, "\n") {
+		k, v, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		v = strings.Trim(strings.TrimSpace(v), `"'`)
+		switch strings.TrimSpace(k) {
+		case "title":
+			title = sanitize.Line(v)
+		case "date", "pubDate", "published":
+			date = v
+		}
+	}
+	return title, date, body
 }
 
 func firstHeading(md string) string {

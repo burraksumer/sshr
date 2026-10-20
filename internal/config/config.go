@@ -115,7 +115,7 @@ func (c Config) Validate() error {
 		}
 	}
 	for _, h := range c.AllowedHosts {
-		if err := checkHost(h); err != nil {
+		if _, _, err := fetch.ParseHost(h); err != nil {
 			return fmt.Errorf("allowed_hosts: %w", err)
 		}
 	}
@@ -184,12 +184,6 @@ func (c Config) Hosts(site *url.URL) []string {
 		hosts = append(hosts, strings.ToLower(strings.TrimSpace(a)))
 	}
 	return hosts
-}
-
-// checkHost accepts "host" or "host:port", without a scheme or path.
-func checkHost(h string) error {
-	_, _, err := fetch.ParseHost(h)
-	return err
 }
 
 // Duration is a time.Duration that reads from TOML strings like "15m".

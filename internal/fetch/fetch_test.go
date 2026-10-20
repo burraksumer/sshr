@@ -336,3 +336,59 @@ func TestMovedURLRequestedDirectly(t *testing.T) {
 		t.Errorf("304 = %v, old URL hits = %d, want a 304 and one hit", res.NotModified, oldHits.Load())
 	}
 }
+
+func TestUnicodeHostMatchesPunycode(t *testing.T) {
+	c := New(Options{Hosts: []string{"bücher.de"}})
+	for _, raw := range []string{"https://xn--bcher-kva.de/", "https://bücher.de/", "https://BÜCHER.de/"} {
+		if err := c.checkURL(mustURL(t, raw)); err != nil {
+			t.Errorf("%s: %v", raw, err)
+		}
+	}
+	if err := c.checkURL(mustURL(t, "https://bucher.de/")); err == nil {
+		t.Error("a different host matched")
+	}
+}
+
+// A robots.txt answering 429 means slow down, not "no rules".
+func TestRobots429Unavailable(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "slow down", http.StatusTooManyRequests)
+	})
+	srv, c := testServer(t, mux.ServeHTTP)
+	if _, err := c.LoadRobots(context.Background(), mustURL(t, srv.URL)); !errors.Is(err, ErrRobotsUnavailable) {
+		t.Errorf("err = %v, want ErrRobotsUnavailable", err)
+	}
+	if _, err := c.Get(context.Background(), mustURL(t, srv.URL+"/x"), "", false); !errors.Is(err, ErrRobotsUnavailable) {
+		t.Errorf("fetch err = %v, want ErrRobotsUnavailable", err)
+	}
+}
+
+// A remembered redirect whose target is gone falls back to the original URL.
+func TestMovedTargetGone(t *testing.T) {
+	var moved atomic.Bool
+	moved.Store(true)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/feed", func(w http.ResponseWriter, r *http.Request) {
+		if moved.Load() {
+			http.Redirect(w, r, "/feed.xml", http.StatusMovedPermanently)
+			return
+		}
+		w.Write([]byte("feed at the old place"))
+	})
+	mux.HandleFunc("/feed.xml", func(w http.ResponseWriter, r *http.Request) {
+		if !moved.Load() {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write([]byte("feed"))
+	})
+	srv, c := testServer(t, mux.ServeHTTP)
+	ctx := context.Background()
+	c.Get(ctx, mustURL(t, srv.URL+"/feed"), "", false)
+	moved.Store(false)
+	res, err := c.Get(ctx, mustURL(t, srv.URL+"/feed"), "", true)
+	if err != nil || string(res.Body) != "feed at the old place" {
+		t.Errorf("got %q, %v", res.Body, err)
+	}
+}

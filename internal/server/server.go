@@ -103,7 +103,7 @@ func New(cfg Config, store *content.Store, log *slog.Logger) (*Server, error) {
 		ip := hostOf(c.RemoteAddr())
 		release, ok := conns.acquire(clientKey(ip))
 		if !ok {
-			log.Warn("connection refused", "ip", ip, "reason", "limit")
+			refusedLog.note(log, ip)
 			return nil
 		}
 		tc := &trackedConn{Conn: c, release: release}
@@ -250,6 +250,27 @@ func (l *limiter) acquire(ip string) (release func(), ok bool) {
 	}, true
 }
 
+// refusedLog logs refused connections at most once a second, so a client
+// hammering the port can't flood the log.
+var refusedLog throttledLog
+
+type throttledLog struct {
+	mu         sync.Mutex
+	last       time.Time
+	suppressed int
+}
+
+func (t *throttledLog) note(log *slog.Logger, ip string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if time.Since(t.last) < time.Second {
+		t.suppressed++
+		return
+	}
+	log.Warn("connection refused", "ip", ip, "reason", "limit", "also_refused", t.suppressed)
+	t.last, t.suppressed = time.Now(), 0
+}
+
 // sessionDeadline is how long a connection may go without an active session,
 // at the start and after each session ends.
 var sessionDeadline = 30 * time.Second
@@ -271,15 +292,17 @@ type trackedConn struct {
 	active   atomic.Int32 // sessions that reached the UI
 	channels atomic.Int32 // open session channels
 
-	mu    sync.Mutex // guards timer, which can fire before it is assigned
-	timer *time.Timer
+	mu     sync.Mutex // guards timer, which can fire before it is assigned
+	timer  *time.Timer
+	closed bool
 }
 
 // rearm restarts the no-session deadline.
 func (c *trackedConn) rearm() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.timer != nil {
+	// A session can end after its connection already closed.
+	if c.timer != nil && !c.closed {
 		c.timer.Reset(sessionDeadline)
 	}
 }
@@ -329,6 +352,7 @@ func (c limitedChannel) Accept() (gossh.Channel, <-chan *gossh.Request, error) {
 
 func (c *trackedConn) Close() error {
 	c.mu.Lock()
+	c.closed = true
 	if c.timer != nil {
 		c.timer.Stop()
 	}
