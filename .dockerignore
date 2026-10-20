@@ -1,0 +1,5 @@
+.git
+.sshr
+sshr
+*.toml
+!sshr.example.toml
