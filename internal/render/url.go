@@ -31,17 +31,19 @@ func Clickable(u string) bool {
 	return false
 }
 
+// resolve returns ref resolved against base, with every byte that isn't
+// printable ASCII percent-encoded.
 func resolve(base, ref string) string {
 	if base == "" {
-		return ref
+		return sanitize.URL(ref)
 	}
 	b, err := url.Parse(base)
 	if err != nil {
-		return ref
+		return sanitize.URL(ref)
 	}
 	r, err := url.Parse(ref)
 	if err != nil {
-		return ref
+		return sanitize.URL(ref)
 	}
-	return b.ResolveReference(r).String()
+	return sanitize.URL(b.ResolveReference(r).String())
 }

@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/burraksumer/sshr/internal/fetch"
+	"github.com/mmcdole/gofeed"
 )
 
 const article = `<!doctype html><html><head><title>%s</title>
@@ -456,5 +457,84 @@ func TestFeedOrderAndType(t *testing.T) {
 	}
 	if strings.Join(titles, ",") != "P5,P4" {
 		t.Errorf("entries = %v, want the newest two", titles)
+	}
+}
+
+// When the feed fails for a moment, its posts stay. When it answers 304,
+// a newer homepage title isn't overwritten by an old feed title it never had.
+func TestFeedOutageAndTitle(t *testing.T) {
+	var feedDown atomic.Bool
+	var siteName atomic.Value
+	siteName.Store("Old Name")
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("/{$}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<html><head><meta property="og:site_name" content="` + siteName.Load().(string) + `">
+<link rel="alternate" type="application/feed+json" href="/feed.json"></head></html>`))
+	})
+	mux.HandleFunc("/feed.json", func(w http.ResponseWriter, r *http.Request) {
+		if feedDown.Load() {
+			http.Error(w, "down", http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("ETag", `"f"`)
+		if r.Header.Get("If-None-Match") == `"f"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("Content-Type", "application/feed+json")
+		w.Write([]byte(`{"version":"https://jsonfeed.org/version/1.1","items":[{"id":"1","url":"` + srv.URL + `/p","title":"P","content_text":"body"}]}`))
+	})
+	mux.HandleFunc("/sitemap.xml", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`<?xml version="1.0"?><urlset><url><loc>/about</loc></url></urlset>`))
+	})
+	mux.HandleFunc("/about", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/markdown")
+		w.Write([]byte("About\n"))
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+
+	base, _ := url.Parse(srv.URL + "/")
+	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Host}, Rate: 1000, Burst: 100}), Base: base}
+	first, err := d.Discover(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	siteName.Store("New Name")
+	second, err := d.Discover(context.Background(), first, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Title != "New Name" {
+		t.Errorf("title after 304 = %q, want the homepage's new name", second.Title)
+	}
+	feedDown.Store(true)
+	third, err := d.Discover(context.Background(), second, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.Lookup(srv.URL+"/p") == nil {
+		t.Error("feed post dropped during a feed outage")
+	}
+}
+
+func TestCapBody(t *testing.T) {
+	long := strings.Repeat("line of text\n", maxBody/13+10)
+	got := capBody(long)
+	if len(got) > maxBody+100 || !strings.Contains(got, "cut short") {
+		t.Errorf("capBody kept %d bytes", len(got))
+	}
+	if capBody("short") != "short" {
+		t.Error("short body changed")
+	}
+}
+
+func TestEntryURLsEncoded(t *testing.T) {
+	feedURL, _ := url.Parse("https://x.example/feed")
+	e := entryFromItem(&gofeed.Item{Link: "https://x.example/p?a=\u009c\u009b2J", Title: "t", Content: "b"}, feedURL)
+	if strings.ContainsAny(e.URL, "\u009c\u009b") {
+		t.Errorf("entry URL kept C1 controls: %q", e.URL)
 	}
 }

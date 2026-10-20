@@ -25,3 +25,9 @@ func TestLine(t *testing.T) {
 		t.Errorf("Line = %q", got)
 	}
 }
+
+func TestURL(t *testing.T) {
+	if got := URL("https://x.example/a b?q=\u009cü&r=%41"); got != "https://x.example/a%20b?q=%C2%9C%C3%BC&r=%41" {
+		t.Errorf("URL = %q", got)
+	}
+}

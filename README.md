@@ -88,7 +88,7 @@ Visitors are anonymous strangers, so sshr is built to give them nothing but the 
 - It never runs a shell or any other program. Commands, SFTP and other subsystems, port forwarding and agent forwarding are all refused.
 - Any public key is accepted after the SSH layer verifies its signature. Visitors without keys get keyboard-interactive auth with no prompts.
 - sshr strips control and escape bytes from everything it fetches. It also neutralizes character references like `&#27;` that the renderer would decode into them, and it filters the rendered output so only its own styling and links get through. A post can't send escape codes to a visitor's terminal.
-- It only fetches from the site's own host and its `www.` variant, plus `allowed_hosts`. That means ports 80 and 443, or the port in the site URL, and redirects get the same check. Content can't point the fetcher at other machines or at other services on the same machine.
+- It only fetches from the site's own host and its `www.` variant, plus `allowed_hosts`. That means ports 80 and 443, or the port in the site URL, and redirects get the same check. Content can't point the fetcher at any host or port outside that list.
 - It follows each host's robots.txt, on redirects too. When robots.txt can't be fetched or answers with a server error, sshr fetches nothing from that host.
 - Connections and sessions are capped per client and in total. IPv6 clients count per /64. New sessions per client are rate limited, and a connection that doesn't open a session within 30 seconds is closed. Sessions end after an idle timeout and a maximum duration.
 - Visitors only ever read from the in-memory snapshot. Fetching happens in the background on a timer, so a flood of visitors never turns into requests to your site.

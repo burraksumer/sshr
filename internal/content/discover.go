@@ -39,6 +39,22 @@ const (
 // path and then to the root.
 var fallbackFeeds = []string{"feed.json", "feed.xml", "atom.xml", "rss.xml", "index.xml", "feed"}
 
+// maxBody caps an entry's markdown. Longer bodies are cut, so one huge page
+// can't make every render slow.
+const maxBody = 1 << 20
+
+// capBody cuts s to maxBody bytes at a line break and notes the cut.
+func capBody(s string) string {
+	if len(s) <= maxBody {
+		return s
+	}
+	cut := s[:maxBody]
+	if i := strings.LastIndexByte(cut, '\n'); i > 0 {
+		cut = cut[:i]
+	}
+	return strings.ToValidUTF8(cut, "") + "\n\n*This entry was cut short because it is very long.*\n"
+}
+
 // DefaultMaxEntries is how many posts and pages a site keeps unless
 // configured otherwise.
 const DefaultMaxEntries = 200
@@ -157,7 +173,7 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 				continue
 			}
 			seen[key] = true
-			entries = append(entries, &Entry{URL: p.loc.String(), Kind: Page, Date: p.lastmod})
+			entries = append(entries, &Entry{URL: sanitize.URL(p.loc.String()), Kind: Page, Date: p.lastmod})
 			room--
 		}
 	}
@@ -186,7 +202,7 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 		}
 	}
 	if len(kept) == 0 {
-		return nil, errors.New("no readable content found (no feed, sitemap or extractable pages)")
+		return nil, errors.New("no readable content found. The site has no feed, sitemap or extractable pages")
 	}
 	return finish(site, kept), nil
 }
@@ -238,6 +254,7 @@ func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []feedLink,
 		site.probeAge = prev.probeAge + 1
 	}
 	parser := gofeed.NewParser()
+	prevFailed := false
 	for _, raw := range candidates {
 		u, err := url.Parse(raw)
 		if err != nil {
@@ -248,39 +265,30 @@ func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []feedLink,
 		res, err := d.Client.GetLarge(ctx, u, acceptFeed, conditional)
 		if err != nil {
 			log.Debug("feed", "url", raw, "err", err)
+			if prev != nil && raw == prev.feedURL && !errors.Is(err, fetch.ErrDisallowed) && !errors.Is(err, fetch.ErrNotAllowed) {
+				prevFailed = true
+			}
 			continue
 		}
 		if res.NotModified && prev != nil {
-			var kept []*Entry
-			for _, e := range prev.feedEntries {
-				c := *e
-				// Bodies fetched from pages get rechecked with a conditional
-				// request, and entries whose fetch failed get retried.
-				if c.pageBody {
-					c.Body, c.pageBody = "", false
-				}
-				kept = append(kept, &c)
-			}
-			if prev.Title != "" {
-				site.Title = prev.Title
-			}
-			if prev.Description != "" {
-				site.Description = prev.Description
-			}
-			return kept, raw
+			return reuseFeed(site, prev), raw
 		}
 		if res.Status != 200 {
+			if prev != nil && raw == prev.feedURL && transient(res.Status) {
+				prevFailed = true
+			}
 			continue
 		}
 		feed, err := parser.Parse(bytes.NewReader(res.Body))
 		if err != nil || len(feed.Items) == 0 {
 			continue
 		}
-		if t := sanitize.Line(feed.Title); t != "" {
-			site.Title = t
+		site.feedTitle, site.feedDescription = sanitize.Line(feed.Title), sanitize.Line(feed.Description)
+		if site.feedTitle != "" {
+			site.Title = site.feedTitle
 		}
-		if desc := sanitize.Line(feed.Description); desc != "" {
-			site.Description = desc
+		if site.feedDescription != "" {
+			site.Description = site.feedDescription
 		}
 		entries := make([]*Entry, 0, len(feed.Items))
 		for _, item := range feed.Items {
@@ -291,7 +299,41 @@ func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []feedLink,
 		log.Info("feed", "url", raw, "items", len(entries))
 		return entries, raw
 	}
+	// The feed that worked last time failed for a moment. Keep its entries
+	// rather than dropping every post until the next refresh.
+	if prevFailed && prev.feedEntries != nil {
+		log.Warn("feed unavailable, keeping previous entries", "url", prev.feedURL)
+		return reuseFeed(site, prev), prev.feedURL
+	}
 	return nil, ""
+}
+
+// reuseFeed returns copies of prev's feed entries and its feed title and
+// description, for a feed that answered 304 or failed for a moment.
+func reuseFeed(site, prev *Site) []*Entry {
+	var kept []*Entry
+	for _, e := range prev.feedEntries {
+		c := *e
+		// Bodies fetched from pages get rechecked with a conditional
+		// request, and entries whose fetch failed get retried.
+		if c.pageBody {
+			c.Body, c.pageBody = "", false
+		}
+		kept = append(kept, &c)
+	}
+	site.feedTitle, site.feedDescription = prev.feedTitle, prev.feedDescription
+	if site.feedTitle != "" {
+		site.Title = site.feedTitle
+	}
+	if site.feedDescription != "" {
+		site.Description = site.feedDescription
+	}
+	return kept
+}
+
+// transient reports whether an HTTP status is worth keeping old data over.
+func transient(status int) bool {
+	return status >= 500 || status == http.StatusTooManyRequests
 }
 
 func entryFromItem(item *gofeed.Item, feedURL *url.URL) *Entry {
@@ -302,7 +344,7 @@ func entryFromItem(item *gofeed.Item, feedURL *url.URL) *Entry {
 	}
 	if link != "" {
 		if u, err := feedURL.Parse(link); err == nil {
-			e.URL = u.String()
+			e.URL = sanitize.URL(u.String())
 		}
 	}
 	e.Title = sanitize.Line(item.Title)
@@ -332,7 +374,7 @@ func entryFromItem(item *gofeed.Item, feedURL *url.URL) *Entry {
 		body = item.Description
 	}
 	if body != "" {
-		e.Body = sanitize.Text(toMarkdown(body, base))
+		e.Body = capBody(sanitize.Text(toMarkdown(body, base)))
 	}
 	if e.URL == "" && e.Body == "" {
 		return nil
@@ -388,7 +430,7 @@ func (d *Discoverer) fillBody(ctx context.Context, e *Entry, old *Entry) error {
 	case res.NotModified && hasOld:
 		reuse(e, old)
 		return nil
-	case (res.Status >= 500 || res.Status == http.StatusTooManyRequests) && hasOld:
+	case transient(res.Status) && hasOld:
 		reuse(e, old)
 		return fmt.Errorf("status %d, kept previous copy", res.Status)
 	case res.Status != 200:
@@ -401,7 +443,7 @@ func (d *Discoverer) fillBody(ctx context.Context, e *Entry, old *Entry) error {
 		if e.Title == "" {
 			e.Title = firstHeading(body)
 		}
-		e.Body, e.pageBody = body, true
+		e.Body, e.pageBody = capBody(body), true
 		return nil
 	case "text/html", "application/xhtml+xml", "":
 	default:
@@ -419,7 +461,7 @@ func (d *Discoverer) fillBody(ctx context.Context, e *Entry, old *Entry) error {
 	if err != nil {
 		return err
 	}
-	e.Body, e.pageBody = sanitize.Text(string(md)), true
+	e.Body, e.pageBody = capBody(sanitize.Text(string(md))), true
 	if e.Title == "" {
 		e.Title = sanitize.Line(article.Title())
 	}
@@ -472,8 +514,8 @@ type sitemapDoc struct {
 // returns page URLs newest first.
 func (d *Discoverer) loadSitemaps(ctx context.Context, roots []string, prev *Site, log *slog.Logger) ([]sitemapURL, map[string]cachedSitemap) {
 	const maxFiles, maxURLs = 10, 2000
-	// robots.txt Sitemap lines can be relative or broken (an unrendered
-	// template, say). Keep the ones that resolve to an allowed URL.
+	// robots.txt Sitemap lines can be relative or broken, like an unrendered
+	// template. Keep the ones that resolve to an allowed URL.
 	var queue []string
 	for _, r := range roots {
 		if u, err := d.Base.Parse(strings.TrimSpace(r)); err == nil && d.Client.Allowed(ctx, u) {
@@ -505,10 +547,13 @@ func (d *Discoverer) loadSitemaps(ctx context.Context, roots []string, prev *Sit
 		res, err := d.Client.Get(ctx, u, acceptXML, hasOld)
 		var c cachedSitemap
 		switch {
+		case err != nil && hasOld && !errors.Is(err, fetch.ErrDisallowed) && !errors.Is(err, fetch.ErrNotAllowed):
+			log.Debug("sitemap unavailable, keeping previous copy", "url", raw, "err", err)
+			c = old
 		case err != nil:
 			log.Debug("sitemap", "url", raw, "err", err)
 			continue
-		case res.NotModified:
+		case res.NotModified, transient(res.Status) && hasOld:
 			c = old
 		case res.Status != 200:
 			continue

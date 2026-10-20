@@ -47,13 +47,14 @@ type Model struct {
 	visible        []*content.Entry
 
 	// reader
-	renders map[renderKey]render.Document
-	entry   *content.Entry
-	doc     render.Document
-	vp      viewport.Model
-	digits  string
-	history []*content.Entry
-	status  string
+	renders   map[renderKey]render.Document
+	resizeGen int
+	entry     *content.Entry
+	doc       render.Document
+	vp        viewport.Model
+	digits    string
+	history   []*content.Entry
+	status    string
 }
 
 // New returns a model that reads from store.
@@ -81,6 +82,12 @@ type renderKey struct {
 
 // maxRenders caps the per-session render cache.
 const maxRenders = 8
+
+// resizeSettle is how long the window size must stay the same before the
+// entry is rendered again.
+const resizeSettle = 120 * time.Millisecond
+
+type resizedMsg struct{ gen int }
 
 type pollMsg struct{}
 
@@ -152,7 +159,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.clampOffset()
-		if m.entry != nil {
+		if m.entry == nil {
+			return m, nil
+		}
+		// Dragging a window edge sends many sizes. Resize the viewport now
+		// and render the text once the size settles.
+		m.vp.SetWidth(m.width)
+		m.vp.SetHeight(max(m.height-1, 1))
+		m.resizeGen++
+		gen := m.resizeGen
+		return m, tea.Tick(resizeSettle, func(time.Time) tea.Msg { return resizedMsg{gen} })
+
+	case resizedMsg:
+		if msg.gen == m.resizeGen && m.entry != nil {
 			m.renderEntry(false)
 		}
 		return m, nil
@@ -299,7 +318,14 @@ func (m Model) updateReader(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		m.back()
 		return m, nil
-	case "q", "h", "left", "backspace":
+	case "backspace":
+		if m.digits != "" {
+			m.digits = m.digits[:len(m.digits)-1]
+			return m, nil
+		}
+		m.back()
+		return m, nil
+	case "q", "h", "left":
 		m.back()
 		return m, nil
 	case "g", "home":

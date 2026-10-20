@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -90,5 +91,13 @@ func TestValidateAllowedHosts(t *testing.T) {
 		if c.Validate() == nil {
 			t.Errorf("%q: no error", bad)
 		}
+	}
+}
+
+func TestLoadRejectsUnknownKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sshr.toml")
+	os.WriteFile(path, []byte("url = \"example.com\"\nmax_per_ipp = 2\n"), 0o600)
+	if _, err := Load(path, true); err == nil || !strings.Contains(err.Error(), "max_per_ipp") {
+		t.Errorf("err = %v, want unknown setting max_per_ipp", err)
 	}
 }

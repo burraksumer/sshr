@@ -60,11 +60,21 @@ func Default() Config {
 func Load(path string, required bool) (Config, error) {
 	cfg := Default()
 	if path != "" {
-		_, err := toml.DecodeFile(path, &cfg)
+		md, err := toml.DecodeFile(path, &cfg)
 		switch {
 		case errors.Is(err, os.ErrNotExist) && !required:
 		case err != nil:
 			return cfg, fmt.Errorf("%s: %w", path, err)
+		default:
+			// A misspelled key would otherwise leave a default in place
+			// without anyone noticing.
+			if keys := md.Undecoded(); len(keys) > 0 {
+				names := make([]string, len(keys))
+				for i, k := range keys {
+					names[i] = k.String()
+				}
+				return cfg, fmt.Errorf("%s: unknown setting %s", path, strings.Join(names, ", "))
+			}
 		}
 	}
 	env := map[string]*string{
@@ -95,7 +105,7 @@ func (c Config) Validate() error {
 	}
 	for name, d := range map[string]Duration{"idle_timeout": c.IdleTimeout, "max_session": c.MaxSession} {
 		if d < 0 {
-			return fmt.Errorf("%s can't be negative (use 0 for no limit)", name)
+			return fmt.Errorf("%s can't be negative. Use \"0s\" for no limit", name)
 		}
 	}
 	for name, n := range map[string]int{"max_entries": c.MaxEntries, "max_sessions": c.MaxSessions, "max_per_ip": c.MaxPerIP} {
@@ -131,7 +141,7 @@ func (c Config) SiteURL() (*url.URL, error) {
 func ParseSiteURL(raw string) (*url.URL, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return nil, errors.New("no site URL set (url in sshr.toml, SSHR_URL, or --url)")
+		return nil, errors.New("no site URL set. Set url in sshr.toml, SSHR_URL or --url")
 	}
 	if !strings.Contains(raw, "://") {
 		raw = "https://" + raw

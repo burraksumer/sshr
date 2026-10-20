@@ -2,7 +2,10 @@
 // interpret as commands. Only sshr's own renderer may emit escape sequences.
 package sanitize
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // Dropped reports whether r is a character Text removes. That covers C0
 // controls other than newline and tab, so ESC and CR go, plus DEL, C1
@@ -32,6 +35,22 @@ func Text(s string) string {
 		}
 		return r
 	}, s)
+}
+
+// URL percent-encodes every byte of s that isn't printable ASCII. Go's
+// url.URL.String leaves non-ASCII in the query as it is, and a C1 control
+// there would reach the terminal inside a hyperlink.
+func URL(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c <= 0x20 || c >= 0x7f {
+			fmt.Fprintf(&b, "%%%02X", c)
+			continue
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
 }
 
 // Line is like Text but also collapses newlines and tabs to spaces, for titles

@@ -1,6 +1,20 @@
 package server
 
-import "testing"
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/url"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/burraksumer/sshr/internal/content"
+	"github.com/burraksumer/sshr/internal/fetch"
+	gossh "golang.org/x/crypto/ssh"
+)
 
 func TestClientKey(t *testing.T) {
 	cases := map[string]string{
@@ -44,5 +58,103 @@ func TestLimiter(t *testing.T) {
 	}
 	if _, ok := l.acquire("d"); ok {
 		t.Error("double release freed an extra slot")
+	}
+}
+
+func startServer(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+	base, _ := url.Parse("http://127.0.0.1:1/")
+	store := content.NewStore(&content.Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Host}}), Base: base}, slog.New(slog.DiscardHandler))
+	srv, err := New(Config{
+		Listen: addr, HostKeyPath: filepath.Join(t.TempDir(), "key"),
+		MaxSessions: 10, MaxPerIP: 5, IdleTimeout: time.Minute, MaxTimeout: time.Minute,
+	}, store, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go srv.ListenAndServe(ctx)
+	for range 50 {
+		if c, err := net.Dial("tcp", addr); err == nil {
+			c.Close()
+			return addr
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("server did not start")
+	return ""
+}
+
+func dial(t *testing.T, addr string) *gossh.Client {
+	t.Helper()
+	c, err := gossh.Dial("tcp", addr, &gossh.ClientConfig{
+		User:            "reader",
+		Auth:            []gossh.AuthMethod{gossh.KeyboardInteractive(func(string, string, []string, []bool) ([]string, error) { return nil, nil })},
+		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
+		Timeout:         5 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	return c
+}
+
+func TestOneSessionChannelPerConnection(t *testing.T) {
+	c := dial(t, startServer(t))
+	if _, err := c.NewSession(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.NewSession(); err == nil {
+		t.Error("second session channel was accepted")
+	}
+}
+
+func TestEnvRequestsCapped(t *testing.T) {
+	c := dial(t, startServer(t))
+	s, err := c.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted := 0
+	for i := range 40 {
+		if s.Setenv(fmt.Sprintf("K%d", i), "v") == nil {
+			accepted++
+		}
+	}
+	if err := s.Setenv("BIG", strings.Repeat("x", 4096)); err == nil {
+		t.Error("oversized env value accepted")
+	}
+	if accepted != maxEnv {
+		t.Errorf("accepted %d env requests, want %d", accepted, maxEnv)
+	}
+}
+
+// A connection whose only session is refused gets closed by the deadline.
+func TestDeadlineAfterRefusedSession(t *testing.T) {
+	old := sessionDeadline
+	sessionDeadline = 500 * time.Millisecond
+	defer func() { sessionDeadline = old }()
+
+	c := dial(t, startServer(t))
+	s, err := c.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No PTY, so requirePTY refuses the session.
+	s.Run("anything")
+	done := make(chan struct{})
+	go func() { c.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Error("connection still open after the deadline")
 	}
 }

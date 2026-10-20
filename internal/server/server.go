@@ -83,12 +83,13 @@ func New(cfg Config, store *content.Store, log *slog.Logger) (*Server, error) {
 			bm.Middleware(func(s ssh.Session) (tea.Model, []tea.ProgramOption) {
 				return ui.New(store), nil
 			}),
+			// Only sessions that passed every check below count as active.
+			markSession(),
 			requirePTY(),
 			limitSessions(sessions),
-			// New sessions per IP: a burst of MaxPerIP, then one per second.
+			// New sessions per IP get a burst of MaxPerIP, then one per second.
 			ratelimiter.Middleware(newRateLimiter(rate.Every(time.Second), cfg.MaxPerIP)),
 			logSessions(log),
-			markSession(),
 		),
 	)
 	if err != nil {
@@ -106,12 +107,14 @@ func New(cfg Config, store *content.Store, log *slog.Logger) (*Server, error) {
 		// Authentication needs no prompts, so a client could hold a slot
 		// without ever reading. Close connections that don't open a
 		// session soon after connecting.
+		tc.mu.Lock()
 		tc.timer = time.AfterFunc(sessionDeadline, func() {
-			if !tc.started.Load() {
+			if tc.active.Load() == 0 {
 				log.Info("closing connection without a session", "ip", ip)
 				_ = tc.Close()
 			}
 		})
+		tc.mu.Unlock()
 		ctx.SetValue(connKey{}, tc)
 		return tc
 	}
@@ -120,7 +123,7 @@ func New(cfg Config, store *content.Store, log *slog.Logger) (*Server, error) {
 	srv.LocalPortForwardingCallback = nil
 	srv.ReversePortForwardingCallback = nil
 	srv.SubsystemHandlers = map[string]ssh.SubsystemHandler{}
-	srv.ChannelHandlers = map[string]ssh.ChannelHandler{"session": ssh.DefaultSessionHandler}
+	srv.ChannelHandlers = map[string]ssh.ChannelHandler{"session": sessionChannel}
 	srv.RequestHandlers = map[string]ssh.RequestHandler{}
 
 	return &Server{srv: srv, cfg: cfg, log: log}, nil
@@ -240,34 +243,107 @@ func (l *limiter) acquire(ip string) (release func(), ok bool) {
 	}, true
 }
 
-// sessionDeadline is how long a connection may stay open before it starts a
-// session.
-const sessionDeadline = 30 * time.Second
+// sessionDeadline is how long a connection may go without an active session,
+// at the start and after each session ends.
+var sessionDeadline = 30 * time.Second
+
+// Limits on what one connection may ask for before its session starts.
+// Visitors need one session channel and send a few env values like TERM and
+// COLORTERM.
+const (
+	maxChannelsPerConn = 1
+	maxEnv             = 16
+	maxEnvBytes        = 1024
+)
 
 type connKey struct{}
 
 type trackedConn struct {
 	net.Conn
-	release func()
-	timer   *time.Timer
-	started atomic.Bool
+	release  func()
+	active   atomic.Int32 // sessions that reached the UI
+	channels atomic.Int32 // open session channels
+
+	mu    sync.Mutex // guards timer, which can fire before it is assigned
+	timer *time.Timer
+}
+
+// rearm restarts the no-session deadline.
+func (c *trackedConn) rearm() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.timer != nil {
+		c.timer.Reset(sessionDeadline)
+	}
+}
+
+// sessionChannel is the library's session handler with per-connection
+// limits. It accepts one session channel at a time and caps env requests,
+// which the library otherwise stores without limit until a shell starts.
+func sessionChannel(srv *ssh.Server, conn *gossh.ServerConn, newChan gossh.NewChannel, ctx ssh.Context) {
+	if tc, ok := ctx.Value(connKey{}).(*trackedConn); ok {
+		if tc.channels.Add(1) > maxChannelsPerConn {
+			tc.channels.Add(-1)
+			_ = newChan.Reject(gossh.ResourceShortage, "one session per connection")
+			return
+		}
+		defer tc.channels.Add(-1)
+	}
+	ssh.DefaultSessionHandler(srv, conn, limitedChannel{newChan}, ctx)
+}
+
+// limitedChannel drops env requests past maxEnv or larger than maxEnvBytes.
+type limitedChannel struct{ gossh.NewChannel }
+
+func (c limitedChannel) Accept() (gossh.Channel, <-chan *gossh.Request, error) {
+	ch, reqs, err := c.NewChannel.Accept()
+	if err != nil {
+		return ch, reqs, err
+	}
+	out := make(chan *gossh.Request)
+	go func() {
+		defer close(out)
+		env := 0
+		for req := range reqs {
+			if req.Type == "env" {
+				env++
+				if env > maxEnv || len(req.Payload) > maxEnvBytes {
+					if req.WantReply {
+						_ = req.Reply(false, nil)
+					}
+					continue
+				}
+			}
+			out <- req
+		}
+	}()
+	return ch, out, nil
 }
 
 func (c *trackedConn) Close() error {
+	c.mu.Lock()
 	if c.timer != nil {
 		c.timer.Stop()
 	}
+	c.mu.Unlock()
 	c.release()
 	return c.Conn.Close()
 }
 
-// markSession records that a connection started a session, which keeps
-// it from being closed by sessionDeadline.
+// markSession counts a session as active while it runs, which keeps its
+// connection from being closed by sessionDeadline. When the last session
+// ends, the deadline starts again.
 func markSession() wish.Middleware {
 	return func(next ssh.Handler) ssh.Handler {
 		return func(s ssh.Session) {
-			if tc, ok := s.Context().Value(connKey{}).(*trackedConn); ok {
-				tc.started.Store(true)
+			tc, ok := s.Context().Value(connKey{}).(*trackedConn)
+			if ok {
+				tc.active.Add(1)
+				defer func() {
+					if tc.active.Add(-1) == 0 {
+						tc.rearm()
+					}
+				}()
 			}
 			next(s)
 		}
@@ -304,6 +380,7 @@ func safeTerm(t string) string {
 type rateLimiter struct {
 	rate  rate.Limit
 	burst int
+	mu    sync.Mutex // makes get-or-create atomic
 	cache *lru.Cache[string, *rate.Limiter]
 }
 
@@ -314,11 +391,13 @@ func newRateLimiter(r rate.Limit, burst int) *rateLimiter {
 
 func (r *rateLimiter) Allow(s ssh.Session) error {
 	key := clientKey(hostOf(s.RemoteAddr()))
+	r.mu.Lock()
 	l, ok := r.cache.Get(key)
 	if !ok {
 		l = rate.NewLimiter(r.rate, r.burst)
 		r.cache.Add(key, l)
 	}
+	r.mu.Unlock()
 	if !l.Allow() {
 		return ratelimiter.ErrRateLimitExceeded
 	}

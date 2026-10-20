@@ -203,7 +203,14 @@ func filterOutput(s string, targets map[string]bool) string {
 }
 
 // allowedOSC accepts OSC 8 hyperlinks to known targets and the OSC 8 reset.
+// The OSC 8 spec limits a target to printable ASCII, and anything else is
+// refused, so a C1 control can't ride along inside a hyperlink.
 func allowedOSC(body string, targets map[string]bool) bool {
+	for i := 0; i < len(body); i++ {
+		if body[i] < 0x20 || body[i] > 0x7e {
+			return false
+		}
+	}
 	rest, ok := strings.CutPrefix(body, "8;")
 	if !ok {
 		return false

@@ -173,3 +173,30 @@ func TestFilterDropsStrayBytes(t *testing.T) {
 		t.Errorf("filterOutput = %q", got)
 	}
 }
+
+// A C1 control in the base URL's query must not reach the output, whether
+// in a link target or as text.
+func TestC1InBaseURL(t *testing.T) {
+	base := "https://example.com/post?a=\u009c\u009b2J\u009d0;pwned\u009c"
+	doc, err := Markdown("click [here](//) now", Options{Width: 80, BaseURL: base})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range []string{"\u009b", "\u009c", "\u009d"} {
+		if strings.Contains(doc.Content, r) {
+			t.Errorf("output contains %q:\n%q", r, doc.Content)
+		}
+		for _, l := range doc.Links {
+			if strings.Contains(l.URL, r) {
+				t.Errorf("link URL contains %q: %q", r, l.URL)
+			}
+		}
+	}
+}
+
+func TestAllowedOSCRejectsNonASCII(t *testing.T) {
+	targets := map[string]bool{"https://x.example/?a=\u009c": true}
+	if allowedOSC("8;id=1;https://x.example/?a=\u009c", targets) {
+		t.Error("OSC with a C1 control was allowed")
+	}
+}

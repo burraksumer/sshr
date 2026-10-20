@@ -41,7 +41,8 @@ type Site struct {
 	Entries     []*Entry
 	FetchedAt   time.Time
 
-	feedURL string
+	feedURL                    string
+	feedTitle, feedDescription string
 	// feedEntries holds every entry from the feed, including those dropped
 	// because their page couldn't be fetched, so a refresh that gets 304
 	// for the feed can retry them.
