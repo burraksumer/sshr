@@ -68,8 +68,9 @@ func serve(ctx context.Context, args []string) error {
 	listen := fs.String("listen", "", "address to listen on (overrides config)")
 	_ = fs.Parse(args)
 
-	// A config file named with --config must exist. The default one is optional.
-	explicit := false
+	// A config file named with --config or SSHR_CONFIG must exist. The
+	// default one is optional.
+	explicit := os.Getenv("SSHR_CONFIG") != ""
 	fs.Visit(func(f *flag.Flag) { explicit = explicit || f.Name == "config" })
 	cfg, err := config.Load(*path, explicit)
 	if err != nil {
@@ -80,6 +81,9 @@ func serve(ctx context.Context, args []string) error {
 	}
 	if *listen != "" {
 		cfg.Listen = *listen
+	}
+	if err := cfg.Validate(); err != nil {
+		return err
 	}
 	log := newLogger(cfg.LogFormat)
 

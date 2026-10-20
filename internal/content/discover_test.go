@@ -6,7 +6,9 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/burraksumer/sshr/internal/fetch"
 )
@@ -144,5 +146,126 @@ func TestAllowlist(t *testing.T) {
 		if _, err := c.Get(context.Background(), u, "", false); err == nil {
 			t.Errorf("fetched %s", raw)
 		}
+	}
+}
+
+func TestTitleFromURL(t *testing.T) {
+	site := finish(&Site{}, []*Entry{
+		{URL: "https://site.example/%1b%5d8%3b%3bevil%07click%1b%5b31mred", Kind: Page},
+		{URL: "https://site.example/%C3%A7ay-demlemek/", Kind: Page},
+	})
+	for _, e := range site.Entries {
+		for _, r := range e.Title {
+			if r < 0x20 || r == 0x7f || r == utf8.RuneError {
+				t.Errorf("title %q contains %U", e.Title, r)
+			}
+		}
+	}
+	if got := site.Lookup("https://site.example/%C3%A7ay-demlemek").Title; got != "Çay demlemek" {
+		t.Errorf("title = %q, want %q", got, "Çay demlemek")
+	}
+}
+
+func TestPlainText(t *testing.T) {
+	cases := map[string]string{
+		"see [this](https://x.com/a) and **bold** `code`":             "see this and bold code",
+		"keep snake_case and a_b":                                     "keep snake_case and a_b",
+		"## Heading\n> quote":                                         "Heading quote",
+		"<p>Hello <a href=\"/x\">world</a></p><script>bad()</script>": "Hello world",
+	}
+	for in, want := range cases {
+		// Summaries go through sanitize.Line, so whitespace doesn't matter.
+		if got := strings.Join(strings.Fields(plainText(in)), " "); got != want {
+			t.Errorf("plainText(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// A broken advertised feed falls back to the common paths, and a sitemap
+// index with relative child URLs is followed.
+func TestFallbacks(t *testing.T) {
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("/{$}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<html><head><link rel="alternate" type="application/rss+xml" href="/old-feed"></head></html>`))
+	})
+	mux.HandleFunc("/index.xml", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`<?xml version="1.0"?><rss version="2.0"><channel><title>T</title><item><title>Post</title>
+<link>` + srv.URL + `/post</link><content:encoded xmlns:content="http://purl.org/rss/1.0/modules/content/">Body text</content:encoded></item></channel></rss>`))
+	})
+	mux.HandleFunc("/sitemap.xml", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`<?xml version="1.0"?><sitemapindex><sitemap><loc>/sitemap-pages.xml</loc></sitemap></sitemapindex>`))
+	})
+	mux.HandleFunc("/sitemap-pages.xml", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`<?xml version="1.0"?><urlset><url><loc>/now</loc></url></urlset>`))
+	})
+	mux.HandleFunc("/now", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/markdown")
+		w.Write([]byte("What I'm doing now.\n"))
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+
+	base, _ := url.Parse(srv.URL + "/")
+	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Hostname()}, Rate: 1000, Burst: 100}), Base: base}
+	site, err := d.Discover(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if site.Lookup(srv.URL+"/post") == nil {
+		t.Error("feed at /index.xml was not used")
+	}
+	if now := site.Lookup(srv.URL + "/now"); now == nil || now.Title != "Now" {
+		t.Errorf("page from child sitemap = %+v", now)
+	}
+}
+
+// A post whose page fetch failed comes back on a later refresh, even when the
+// feed answers 304.
+func TestRefreshRetriesDroppedPost(t *testing.T) {
+	var pageCalls atomic.Int32
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("/feed.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"1"`)
+		if r.Header.Get("If-None-Match") == `"1"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("Content-Type", "application/feed+json")
+		w.Write([]byte(`{"version":"https://jsonfeed.org/version/1.1","title":"T","items":[
+{"id":"1","url":"` + srv.URL + `/full","title":"Full","content_text":"Full body"},
+{"id":"2","url":"` + srv.URL + `/flaky","title":"Flaky","summary":"s"}]}`))
+	})
+	mux.HandleFunc("/flaky", func(w http.ResponseWriter, r *http.Request) {
+		if pageCalls.Add(1) == 1 {
+			http.Error(w, "down", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "text/markdown")
+		w.Write([]byte("Flaky body\n"))
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+
+	base, _ := url.Parse(srv.URL + "/")
+	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Hostname()}, Rate: 1000, Burst: 100}), Base: base}
+	first, err := d.Discover(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Lookup(srv.URL+"/flaky") != nil {
+		t.Fatal("flaky post should be missing after the failed fetch")
+	}
+	second, err := d.Discover(context.Background(), first, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e := second.Lookup(srv.URL + "/flaky"); e == nil || !strings.Contains(e.Body, "Flaky body") {
+		t.Errorf("flaky post not recovered: %+v", e)
+	}
+	if second.Lookup(srv.URL+"/full") == nil {
+		t.Error("full post lost on 304")
 	}
 }

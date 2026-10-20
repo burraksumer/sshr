@@ -7,7 +7,8 @@ url = "https://example.com"
 # sshr fetches nothing outside this list and the site's own host.
 # allowed_hosts = ["cdn.example.com"]
 
-# How often to re-read the site, and how many posts and pages to keep.
+# How often to re-read the site (at least 1m), and how many posts and pages
+# to keep.
 # refresh = "15m"
 # max_entries = 200
 
@@ -17,8 +18,8 @@ url = "https://example.com"
 # Limits for anonymous visitors.
 # max_sessions = 200      # across everyone
 # max_per_ip = 5          # concurrent, plus a burst of new sessions
-# idle_timeout = "15m"
-# max_session = "2h"
+# idle_timeout = "15m"    # "0s" for no limit
+# max_session = "2h"      # "0s" for no limit
 
 # Behind a load balancer that sends PROXY protocol headers. Connections from
 # any other address are rejected.

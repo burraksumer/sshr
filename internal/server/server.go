@@ -137,9 +137,20 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		}
 		return err
 	case <-ctx.Done():
-		sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		// Readers never finish on their own, so give open sessions a moment
+		// and then close them. Either way the shutdown is clean.
+		sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		return s.srv.Shutdown(sctx)
+		if err := s.srv.Shutdown(sctx); errors.Is(err, context.DeadlineExceeded) {
+			s.log.Info("closing open sessions")
+			if err := s.srv.Close(); err != nil && !errors.Is(err, ssh.ErrServerClosed) {
+				return err
+			}
+			return nil
+		} else if err != nil && !errors.Is(err, ssh.ErrServerClosed) {
+			return err
+		}
+		return nil
 	}
 }
 

@@ -72,25 +72,38 @@ func New(store *content.Store) Model {
 
 type pollMsg struct{}
 
+// The store replaces its snapshot after each refresh. Sessions check for a
+// new one this often, which is a pointer comparison.
+const pollInterval = 2 * time.Second
+
 func poll() tea.Cmd {
-	return tea.Tick(time.Second, func(time.Time) tea.Msg { return pollMsg{} })
+	return tea.Tick(pollInterval, func(time.Time) tea.Msg { return pollMsg{} })
 }
 
 func (m Model) Init() tea.Cmd {
-	cmds := []tea.Cmd{tea.RequestBackgroundColor}
-	if m.site == nil {
-		cmds = append(cmds, poll())
-	}
-	return tea.Batch(cmds...)
+	return tea.Batch(tea.RequestBackgroundColor, poll())
 }
 
-// syncSite picks up a newer snapshot from the store, if there is one.
+// syncSite picks up a newer snapshot from the store, if there is one, and
+// keeps the cursor on the same entry.
 func (m *Model) syncSite() {
 	site, err := m.store.Site()
 	m.loadErr = err
-	if site != nil && site != m.site {
-		m.site = site
-		m.applyFilter()
+	if site == nil || site == m.site {
+		return
+	}
+	var selected string
+	if m.cursor < len(m.visible) {
+		selected = m.visible[m.cursor].URL
+	}
+	m.site = site
+	m.applyFilter()
+	for i, e := range m.visible {
+		if selected != "" && e.URL == selected {
+			m.cursor = i
+			m.clampOffset()
+			break
+		}
 	}
 }
 
@@ -144,10 +157,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case pollMsg:
 		m.syncSite()
-		if m.site == nil {
-			return m, poll()
-		}
-		return m, nil
+		return m, poll()
 
 	case tea.KeyPressMsg:
 		if msg.String() == "ctrl+c" {

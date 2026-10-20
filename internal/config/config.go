@@ -78,6 +78,34 @@ func Load(path string, required bool) (Config, error) {
 	return cfg, nil
 }
 
+// MinRefresh is the shortest allowed refresh interval, so a typo can't make
+// sshr crawl a site in a loop.
+const MinRefresh = time.Minute
+
+// Validate checks values that would make sshr misbehave rather than fail.
+func (c Config) Validate() error {
+	if _, err := c.SiteURL(); err != nil {
+		return err
+	}
+	if c.Refresh.D() < MinRefresh {
+		return fmt.Errorf("refresh must be at least %s, got %s", MinRefresh, c.Refresh.D())
+	}
+	for name, d := range map[string]Duration{"idle_timeout": c.IdleTimeout, "max_session": c.MaxSession} {
+		if d < 0 {
+			return fmt.Errorf("%s can't be negative (use 0 for no limit)", name)
+		}
+	}
+	for name, n := range map[string]int{"max_entries": c.MaxEntries, "max_sessions": c.MaxSessions, "max_per_ip": c.MaxPerIP} {
+		if n <= 0 {
+			return fmt.Errorf("%s must be positive, got %d", name, n)
+		}
+	}
+	if c.LogFormat != "json" && c.LogFormat != "text" {
+		return fmt.Errorf(`log_format must be "json" or "text", got %q`, c.LogFormat)
+	}
+	return nil
+}
+
 // SiteURL validates URL and returns it parsed.
 func (c Config) SiteURL() (*url.URL, error) {
 	return ParseSiteURL(c.URL)

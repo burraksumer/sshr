@@ -28,6 +28,8 @@ type Entry struct {
 	Body string
 
 	fromFeed bool
+	// pageBody means Body came from fetching the page, not from the feed.
+	pageBody bool
 }
 
 // Site is an immutable snapshot of a website's content. Sessions share it and
@@ -40,7 +42,11 @@ type Site struct {
 	FetchedAt   time.Time
 
 	feedURL string
-	byURL   map[string]*Entry
+	// feedEntries holds every entry from the feed, including those dropped
+	// because their page couldn't be fetched, so a refresh that gets 304
+	// for the feed can retry them.
+	feedEntries []*Entry
+	byURL       map[string]*Entry
 }
 
 // Lookup returns the entry for rawURL, or nil if the site has none.

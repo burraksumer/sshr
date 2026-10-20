@@ -10,9 +10,10 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}"
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /sshr /sshr
 COPY --from=build --chown=nonroot:nonroot /data /data
+# sshr reads sshr.toml from the working directory if one is mounted there.
+WORKDIR /etc/sshr
 ENV SSHR_LISTEN=:2222 \
-    SSHR_HOST_KEY=/data/host_ed25519 \
-    SSHR_CONFIG=/etc/sshr/sshr.toml
+    SSHR_HOST_KEY=/data/host_ed25519
 VOLUME /data
 EXPOSE 2222
 ENTRYPOINT ["/sshr"]

@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	readability "codeberg.org/readeck/go-readability/v2"
 	htmltomarkdown "github.com/JohannesKaufmann/html-to-markdown/v2"
@@ -89,6 +91,7 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 	if len(entries) > maxEntries {
 		entries = entries[:maxEntries]
 	}
+	feedEntries := slices.Clone(entries)
 
 	// The sitemap adds pages the feed doesn't list.
 	seen := map[string]bool{normalize(d.Base): true}
@@ -132,6 +135,7 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 	}
 
 	d.fillBodies(ctx, entries, prev, log)
+	site.feedEntries = feedEntries
 
 	var kept []*Entry
 	for _, e := range entries {
@@ -149,7 +153,8 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 func finish(site *Site, kept []*Entry) *Site {
 	for _, e := range kept {
 		if e.Title == "" {
-			e.Title = titleFromURL(e.URL)
+			// The URL path is percent-decoded and can hold control bytes.
+			e.Title = sanitize.Line(titleFromURL(e.URL))
 		}
 	}
 	sort.SliceStable(kept, func(i, j int) bool {
@@ -174,10 +179,12 @@ func finish(site *Site, kept []*Entry) *Site {
 // loadFeed tries feed candidates in order and returns the entries of the first
 // one that parses with at least one item.
 func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []string, prev *Site, log *slog.Logger) ([]*Entry, string) {
+	// Advertised feeds first, then the common paths, in case the advertised
+	// ones are broken.
 	candidates := sortFeeds(links)
-	if len(candidates) == 0 {
-		for _, p := range fallbackFeeds {
-			candidates = append(candidates, d.Base.ResolveReference(&url.URL{Path: p}).String())
+	for _, p := range fallbackFeeds {
+		if c := d.Base.ResolveReference(&url.URL{Path: p}).String(); !slices.Contains(candidates, c) {
+			candidates = append(candidates, c)
 		}
 	}
 	parser := gofeed.NewParser()
@@ -193,12 +200,23 @@ func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []string, p
 			continue
 		}
 		if res.NotModified {
-			var kept []*Entry
-			for _, e := range prev.Entries {
-				if e.fromFeed {
-					c := *e
-					kept = append(kept, &c)
+			src := prev.feedEntries
+			if src == nil {
+				for _, e := range prev.Entries {
+					if e.fromFeed {
+						src = append(src, e)
+					}
 				}
+			}
+			var kept []*Entry
+			for _, e := range src {
+				c := *e
+				// Bodies fetched from pages get rechecked with a conditional
+				// request, and entries whose fetch failed get retried.
+				if c.pageBody {
+					c.Body, c.pageBody = "", false
+				}
+				kept = append(kept, &c)
 			}
 			if prev.Title != "" {
 				site.Title = prev.Title
@@ -261,7 +279,7 @@ func entryFromItem(item *gofeed.Item, feedURL *url.URL) *Entry {
 		base = feedURL.String()
 	}
 	if item.Description != "" {
-		e.Summary = sanitize.Line(plainText(item.Description, base))
+		e.Summary = sanitize.Line(plainText(item.Description))
 		e.Summary = truncate(e.Summary, 300)
 	}
 	// Full content wins. Some RSS feeds put the whole post in <description>,
@@ -322,7 +340,7 @@ func (d *Discoverer) fillBody(ctx context.Context, e *Entry, old *Entry) error {
 		return err
 	}
 	if res.NotModified {
-		e.Body, e.Kind = old.Body, old.Kind
+		e.Body, e.Kind, e.pageBody = old.Body, old.Kind, true
 		if e.Title == "" {
 			e.Title = old.Title
 		}
@@ -344,7 +362,7 @@ func (d *Discoverer) fillBody(ctx context.Context, e *Entry, old *Entry) error {
 		if e.Title == "" {
 			e.Title = firstHeading(body)
 		}
-		e.Body = body
+		e.Body, e.pageBody = body, true
 		return nil
 	case "text/html", "application/xhtml+xml", "":
 	default:
@@ -362,7 +380,7 @@ func (d *Discoverer) fillBody(ctx context.Context, e *Entry, old *Entry) error {
 	if err != nil {
 		return err
 	}
-	e.Body = sanitize.Text(string(md))
+	e.Body, e.pageBody = sanitize.Text(string(md)), true
 	if e.Title == "" {
 		e.Title = sanitize.Line(article.Title())
 	}
@@ -435,7 +453,9 @@ func (d *Discoverer) loadSitemaps(ctx context.Context, roots []string, log *slog
 			continue
 		}
 		for _, s := range doc.Sitemaps {
-			queue = append(queue, strings.TrimSpace(s.Loc))
+			if child, err := res.URL.Parse(strings.TrimSpace(s.Loc)); err == nil && d.Client.Allowed(child) {
+				queue = append(queue, child.String())
+			}
 		}
 		for _, x := range doc.URLs {
 			loc, err := res.URL.Parse(strings.TrimSpace(x.Loc))
@@ -554,11 +574,43 @@ func toMarkdown(s, base string) string {
 	return md
 }
 
-var mdSyntax = regexp.MustCompile("[*_`#>\\[\\]]|\\]\\([^)]*\\)")
+var (
+	mdLink   = regexp.MustCompile(`!?\[([^\]]*)\]\([^)]*\)`)
+	mdMarker = regexp.MustCompile("(?m)^\\s*(#+|>+)\\s*|\\*\\*|`")
+)
 
-func plainText(s, base string) string {
-	s = toMarkdown(s, base)
-	return mdSyntax.ReplaceAllString(s, "")
+// plainText turns an HTML or markdown summary into plain text for search.
+func plainText(s string) string {
+	if htmlTag.MatchString(s) {
+		return htmlText(s)
+	}
+	s = mdLink.ReplaceAllString(s, "$1")
+	return mdMarker.ReplaceAllString(s, "")
+}
+
+func htmlText(s string) string {
+	var b strings.Builder
+	z := html.NewTokenizer(strings.NewReader(s))
+	skip := 0
+	for {
+		switch z.Next() {
+		case html.ErrorToken:
+			return b.String()
+		case html.StartTagToken:
+			if name, _ := z.TagName(); string(name) == "script" || string(name) == "style" {
+				skip++
+			}
+		case html.EndTagToken:
+			if name, _ := z.TagName(); (string(name) == "script" || string(name) == "style") && skip > 0 {
+				skip--
+			}
+		case html.TextToken:
+			if skip == 0 {
+				b.Write(z.Text())
+				b.WriteByte(' ')
+			}
+		}
+	}
 }
 
 func firstHeading(md string) string {
@@ -584,7 +636,8 @@ func titleFromURL(raw string) string {
 	if base == "" {
 		return u.Hostname()
 	}
-	return strings.ToUpper(base[:1]) + base[1:]
+	r, size := utf8.DecodeRuneInString(base)
+	return string(unicode.ToUpper(r)) + base[size:]
 }
 
 // readablePath filters out sitemap entries that are files rather than pages.
