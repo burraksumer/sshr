@@ -221,6 +221,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m Model) updateList(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	k := msg.String()
+	// The loading screen only offers quitting.
+	if m.site == nil {
+		if k == "q" {
+			return m, tea.Quit
+		}
+		return m, nil
+	}
 	if m.filtering {
 		switch k {
 		case "esc":
@@ -349,6 +356,11 @@ func (m *Model) follow(n int) {
 }
 
 func (m *Model) open(e *content.Entry, push bool) {
+	// A click can open an entry while the search box has focus.
+	if m.filtering {
+		m.filtering = false
+		m.filter.Blur()
+	}
 	if push && m.entry != nil {
 		m.history = append(m.history, m.entry)
 	}

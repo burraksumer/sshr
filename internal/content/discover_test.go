@@ -717,3 +717,72 @@ func TestRobotsOutageKeepsPage(t *testing.T) {
 		t.Errorf("post lost during a robots.txt outage: %+v", e)
 	}
 }
+
+// During a robots.txt outage, and when a sitemap comes back as an HTML
+// page, sitemap pages keep last refresh's copies.
+func TestSitemapPagesSurviveOutages(t *testing.T) {
+	var robotsDown, sitemapHTML atomic.Bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) {
+		if robotsDown.Load() {
+			http.Error(w, "down", http.StatusServiceUnavailable)
+			return
+		}
+		w.Write([]byte("User-agent: *\nAllow: /\nSitemap: /sitemap_index.xml\n"))
+	})
+	mux.HandleFunc("/sitemap_index.xml", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`<?xml version="1.0"?><sitemapindex><sitemap><loc>/sitemap-pages.xml</loc></sitemap></sitemapindex>`))
+	})
+	mux.HandleFunc("/sitemap-pages.xml", func(w http.ResponseWriter, r *http.Request) {
+		if sitemapHTML.Load() {
+			w.Header().Set("Content-Type", "text/html")
+			w.Write([]byte("<html>maintenance</html>"))
+			return
+		}
+		w.Write([]byte(`<?xml version="1.0"?><urlset><url><loc>/about</loc></url></urlset>`))
+	})
+	mux.HandleFunc("/about", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/markdown")
+		w.Write([]byte("About\n"))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	base, _ := url.Parse(srv.URL + "/")
+	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Host}, Rate: 1000, Burst: 100}), Base: base}
+	site, err := d.Discover(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sitemapHTML.Store(true)
+	if site, err = d.Discover(context.Background(), site, nil); err != nil || site.Lookup(srv.URL+"/about") == nil {
+		t.Fatalf("page lost when the sitemap served HTML: %v", err)
+	}
+	sitemapHTML.Store(false)
+	robotsDown.Store(true)
+	if site, err = d.Discover(context.Background(), site, nil); err != nil || site.Lookup(srv.URL+"/about") == nil {
+		t.Fatalf("page lost during a robots.txt outage: %v", err)
+	}
+}
+
+func TestDuplicateFeedItems(t *testing.T) {
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("/feed.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/feed+json")
+		host := strings.TrimPrefix(srv.URL, "http://")
+		w.Write([]byte(`{"version":"https://jsonfeed.org/version/1.1","items":[
+{"id":"1","url":"` + srv.URL + `/p/","title":"P","content_text":"a"},
+{"id":"2","url":"http://` + host + `/p","title":"P again","content_text":"b"}]}`))
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+	base, _ := url.Parse(srv.URL + "/")
+	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Host}, Rate: 1000, Burst: 100}), Base: base}
+	site, err := d.Discover(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(site.Entries) != 1 || site.Entries[0].Title != "P" {
+		t.Errorf("entries = %d, first %q", len(site.Entries), site.Entries[0].Title)
+	}
+}

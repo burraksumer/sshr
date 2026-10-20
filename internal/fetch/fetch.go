@@ -146,6 +146,10 @@ func New(opts Options) *Client {
 			if err := c.checkURL(req.URL); err != nil {
 				return err
 			}
+			// Each hop is a request to the site, so it waits its turn.
+			if err := c.limiter.Wait(req.Context()); err != nil {
+				return err
+			}
 			if req.Context().Value(skipRobots{}) == nil {
 				if allowed, unavailable := c.robotsAllow(req.Context(), req.URL); !allowed {
 					return robotsError(req.URL, unavailable)
@@ -175,6 +179,17 @@ func (c *Client) EndRound() {
 			delete(c.validators, k)
 		}
 	}
+}
+
+// MayFetch is like Allowed but also says yes while robots.txt is unavailable.
+// The fetch itself then fails with ErrRobotsUnavailable, and callers can fall
+// back to a copy from an earlier refresh.
+func (c *Client) MayFetch(ctx context.Context, u *url.URL) bool {
+	if c.checkURL(u) != nil {
+		return false
+	}
+	allowed, unavailable := c.robotsAllow(ctx, u)
+	return allowed || unavailable
 }
 
 // Allowed reports whether u is on the allowlist and not blocked by its host's
@@ -290,7 +305,10 @@ func (c *Client) LoadRobots(ctx context.Context, base *url.URL) ([]string, error
 	e, err := c.fetchRobots(ctx, base)
 	c.robotsMu.Unlock()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrRobotsUnavailable, err)
+	}
+	if e.unavailable {
+		return nil, ErrRobotsUnavailable
 	}
 	data := e.data
 	if g := data.FindGroup(robotsAgent); g != nil && g.CrawlDelay > 0 {

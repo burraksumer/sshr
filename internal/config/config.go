@@ -177,7 +177,7 @@ func (c Config) Hosts(site *url.URL) []string {
 	hosts := []string{withPort(h)}
 	if bare, ok := strings.CutPrefix(h, "www."); ok {
 		hosts = append(hosts, withPort(bare))
-	} else if strings.Contains(h, ".") && hasLetters(h) {
+	} else if strings.Contains(h, ".") && net.ParseIP(h) == nil {
 		hosts = append(hosts, withPort("www."+h))
 	}
 	for _, a := range c.AllowedHosts {
@@ -205,16 +205,6 @@ func checkHost(h string) error {
 		}
 	}
 	return nil
-}
-
-// hasLetters reports whether h is a DNS name rather than an IP address.
-func hasLetters(h string) bool {
-	for _, r := range h {
-		if (r < '0' || r > '9') && r != '.' && r != ':' {
-			return true
-		}
-	}
-	return false
 }
 
 // Duration is a time.Duration that reads from TOML strings like "15m".

@@ -47,6 +47,9 @@ type Site struct {
 	// because their page couldn't be fetched, so a refresh that gets 304
 	// for the feed can retry them.
 	feedEntries []*Entry
+	// robotsSitemaps is the sitemap list from robots.txt, reused when
+	// robots.txt can't be fetched.
+	robotsSitemaps []string
 	// sitemaps holds parsed sitemaps by URL for conditional requests.
 	sitemaps map[string]cachedSitemap
 	// probeAge counts refreshes since the common feed paths were probed.

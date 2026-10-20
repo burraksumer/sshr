@@ -101,3 +101,10 @@ func TestLoadRejectsUnknownKeys(t *testing.T) {
 		t.Errorf("err = %v, want unknown setting max_per_ipp", err)
 	}
 }
+
+func TestHostsNoWWWForIPv6(t *testing.T) {
+	u, _ := ParseSiteURL("http://[::ffff:10.0.0.5]")
+	if got := (Config{}).Hosts(u); len(got) != 1 {
+		t.Errorf("Hosts = %v, want just the address", got)
+	}
+}

@@ -117,9 +117,13 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 	sitemaps, err := d.Client.LoadRobots(ctx, d.Base)
 	if err != nil {
 		log.Warn("robots.txt", "err", err)
+		// Use last round's sitemap list, so cached sitemaps are found.
+		if prev != nil {
+			sitemaps = prev.robotsSitemaps
+		}
 	}
 
-	site := &Site{URL: d.Base.String(), Title: d.Base.Hostname()}
+	site := &Site{URL: d.Base.String(), Title: d.Base.Hostname(), robotsSitemaps: sitemaps}
 	var feedLinks []feedLink
 	if res, err := d.Client.Get(ctx, d.Base, acceptHTML, false); err != nil {
 		log.Warn("homepage", "err", err)
@@ -185,7 +189,7 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 				break
 			}
 			key := normalize(p.loc)
-			if seen[key] || !d.Client.Allowed(ctx, p.loc) {
+			if seen[key] || !d.Client.MayFetch(ctx, p.loc) {
 				continue
 			}
 			seen[key] = true
@@ -299,10 +303,20 @@ func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []feedLink,
 		}
 		scope := d.scope()
 		entries := make([]*Entry, 0, len(feed.Items))
+		seenItem := map[string]bool{}
 		for _, item := range feed.Items {
 			e := entryFromItem(item, res.URL)
 			if e == nil {
 				continue
+			}
+			// Feeds sometimes list a post twice, or under both www and bare
+			// hosts. Keep the first.
+			if u, err := url.Parse(e.URL); e.URL != "" && err == nil {
+				if key := normalize(u); seenItem[key] {
+					continue
+				} else {
+					seenItem[key] = true
+				}
 			}
 			// A site-wide feed found from a /blog site only counts for
 			// its /blog posts.
@@ -455,22 +469,42 @@ func (d *Discoverer) fillBody(ctx context.Context, e *Entry, old *Entry) error {
 	hasOld := old != nil && old.Body != ""
 	res, err := d.Client.Get(ctx, u, acceptPage, hasOld)
 	switch {
-	case err != nil && hasOld && !permanent(err):
-		// A timeout or connection error. Keep last refresh's copy rather
-		// than dropping the entry until the next refresh.
+	case keepPrevious(res, err, hasOld):
 		reuse(e, old)
-		return fmt.Errorf("kept previous copy: %w", err)
+		if err != nil {
+			return fmt.Errorf("kept previous copy: %w", err)
+		}
+		return nil
 	case err != nil:
 		return err
-	case res.NotModified && hasOld:
-		reuse(e, old)
-		return nil
-	case transient(res.Status) && hasOld:
-		reuse(e, old)
-		return fmt.Errorf("status %d, kept previous copy", res.Status)
 	case res.Status != 200:
 		return fmt.Errorf("status %d", res.Status)
 	}
+	if err := d.readPage(e, res); err != nil {
+		if hasOld {
+			reuse(e, old)
+			return fmt.Errorf("kept previous copy: %w", err)
+		}
+		return err
+	}
+	return nil
+}
+
+// keepPrevious reports whether a fetch result means an earlier copy should
+// be kept: a 304, a 5xx or 429, or an error that isn't a refusal. It needs
+// an earlier copy to keep.
+func keepPrevious(res *fetch.Response, err error, hasOld bool) bool {
+	switch {
+	case !hasOld:
+		return false
+	case err != nil:
+		return !permanent(err)
+	}
+	return res.NotModified || transient(res.Status)
+}
+
+// readPage fills e from a fetched page, as markdown or extracted HTML.
+func (d *Discoverer) readPage(e *Entry, res *fetch.Response) error {
 
 	switch res.ContentType {
 	case "text/markdown", "text/x-markdown", "text/plain":
@@ -536,7 +570,8 @@ type sitemapURL struct {
 }
 
 type sitemapDoc struct {
-	URLs []struct {
+	XMLName xml.Name
+	URLs    []struct {
 		Loc     string `xml:"loc"`
 		LastMod string `xml:"lastmod"`
 	} `xml:"url"`
@@ -553,7 +588,7 @@ func (d *Discoverer) loadSitemaps(ctx context.Context, roots []string, prev *Sit
 	// template. Keep the ones that resolve to an allowed URL.
 	var queue []string
 	for _, r := range roots {
-		if u, err := d.Base.Parse(strings.TrimSpace(r)); err == nil && d.Client.Allowed(ctx, u) {
+		if u, err := d.Base.Parse(strings.TrimSpace(r)); err == nil && d.Client.MayFetch(ctx, u) {
 			queue = append(queue, u.String())
 		}
 	}
@@ -582,26 +617,32 @@ func (d *Discoverer) loadSitemaps(ctx context.Context, roots []string, prev *Sit
 		res, err := d.Client.Get(ctx, u, acceptXML, hasOld)
 		var c cachedSitemap
 		switch {
-		case err != nil && hasOld && !permanent(err):
-			log.Debug("sitemap unavailable, keeping previous copy", "url", raw, "err", err)
+		case keepPrevious(res, err, hasOld):
 			c = old
 		case err != nil:
 			log.Debug("sitemap", "url", raw, "err", err)
 			continue
-		case res.NotModified, transient(res.Status) && hasOld:
-			c = old
 		case res.Status != 200:
 			continue
 		default:
 			var doc sitemapDoc
-			if err := xml.Unmarshal(res.Body, &doc); err != nil {
+			err := xml.Unmarshal(res.Body, &doc)
+			isSitemap := err == nil && (doc.XMLName.Local == "urlset" || doc.XMLName.Local == "sitemapindex")
+			switch {
+			case isSitemap:
+				c = parseSitemap(doc, res.URL, scope, maxURLs)
+			case hasOld:
+				// Not a sitemap, like an error page sent with status 200.
+				// Well-formed HTML parses as XML, so the root element
+				// decides.
+				c = old
+			default:
 				continue
 			}
-			c = parseSitemap(doc, res.URL, scope, maxURLs)
 		}
 		cache[raw] = c
 		for _, child := range c.children {
-			if u, err := url.Parse(child); err == nil && d.Client.Allowed(ctx, u) {
+			if u, err := url.Parse(child); err == nil && d.Client.MayFetch(ctx, u) {
 				queue = append(queue, child)
 			}
 		}

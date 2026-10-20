@@ -46,3 +46,22 @@ func TestResizeRendersOnceSettled(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadingScreenOnlyQuits(t *testing.T) {
+	m := Model{st: newStyles(true)}
+	tm, _ := m.Update(key("/"))
+	if tm.(Model).filtering {
+		t.Error("search opened on the loading screen")
+	}
+	if _, cmd := tm.(Model).Update(key("q")); cmd == nil {
+		t.Error("q did not quit on the loading screen")
+	}
+}
+
+func TestOpenClearsSearchFocus(t *testing.T) {
+	m := Model{st: newStyles(true), filtering: true, entry: nil}
+	m.open(&content.Entry{Body: "x"}, false)
+	if m.filtering {
+		t.Error("search still focused after opening an entry")
+	}
+}
