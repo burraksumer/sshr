@@ -72,8 +72,10 @@ const reprobeEvery = 24
 // "/blog/" when the site URL is example.com/blog.
 func (d *Discoverer) scope() string {
 	p := d.Base.Path
-	// A URL that names a file, like /blog/index.html, means its directory.
-	if path.Ext(p) != "" {
+	// A URL that names a page file, like /blog/index.html, means its
+	// directory. Other dots, as in /~jane.doe or /docs/v2.0, are part of
+	// the directory name.
+	if pageExts[strings.ToLower(path.Ext(p))] {
 		p = path.Dir(p)
 	}
 	if !strings.HasSuffix(p, "/") {
@@ -462,21 +464,6 @@ func (d *Discoverer) fillBodies(ctx context.Context, entries []*Entry, prev *Sit
 		budget = DefaultPageBudget
 	}
 	deadline := time.Now().Add(budget)
-	jobs := make(chan *Entry)
-	var wg sync.WaitGroup
-	for range workers {
-		wg.Go(func() {
-			for e := range jobs {
-				var old *Entry
-				if prev != nil {
-					old = prev.Lookup(e.URL)
-				}
-				if err := d.fillBody(ctx, e, old); err != nil {
-					log.Debug("page", "url", e.URL, "err", err)
-				}
-			}
-		})
-	}
 	// Entries with no earlier copy go first, so a budget that runs out
 	// doesn't keep skipping the same new entries every refresh.
 	var todo []*Entry
@@ -485,24 +472,43 @@ func (d *Discoverer) fillBodies(ctx context.Context, entries []*Entry, prev *Sit
 			todo = append(todo, e)
 		}
 	}
-	hasOld := func(e *Entry) bool {
-		if prev == nil {
-			return false
+	// After those, the copies fetched longest ago, so the budget rotates
+	// through the rest instead of always refetching the same ones.
+	olds := make(map[*Entry]*Entry, len(todo))
+	for _, e := range todo {
+		if prev != nil {
+			if old := prev.Lookup(e.URL); old != nil && old.Body != "" {
+				olds[e] = old
+			}
 		}
-		old := prev.Lookup(e.URL)
-		return old != nil && old.Body != ""
 	}
-	sort.SliceStable(todo, func(i, j int) bool { return !hasOld(todo[i]) && hasOld(todo[j]) })
+	sort.SliceStable(todo, func(i, j int) bool {
+		a, b := olds[todo[i]], olds[todo[j]]
+		switch {
+		case a == nil || b == nil:
+			return a == nil && b != nil
+		}
+		return a.fetchedAt.Before(b.fetchedAt)
+	})
+	jobs := make(chan *Entry)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Go(func() {
+			for e := range jobs {
+				if err := d.fillBody(ctx, e, olds[e]); err != nil {
+					log.Debug("page", "url", e.URL, "err", err)
+				}
+			}
+		})
+	}
 	skipped := 0
 	for _, e := range todo {
 		// Past the budget, entries keep last refresh's copy, if there is
 		// one, and get fetched in a later refresh.
 		if time.Now().After(deadline) {
 			skipped++
-			if prev != nil {
-				if old := prev.Lookup(e.URL); old != nil && old.Body != "" {
-					reuse(e, old)
-				}
+			if old := olds[e]; old != nil {
+				reuse(e, old)
 			}
 			continue
 		}
@@ -530,6 +536,9 @@ func (d *Discoverer) fillBody(ctx context.Context, e *Entry, old *Entry) error {
 		reuse(e, old)
 		if err != nil {
 			return fmt.Errorf("kept previous copy: %w", err)
+		}
+		if res.NotModified {
+			e.fetchedAt = time.Now()
 		}
 		return nil
 	case err != nil:
@@ -569,7 +578,7 @@ func (d *Discoverer) readPage(e *Entry, res *fetch.Response) error {
 		if e.Title == "" {
 			e.Title = firstHeading(body)
 		}
-		e.Body, e.pageBody = capBody(body), true
+		e.Body, e.pageBody, e.fetchedAt = capBody(body), true, time.Now()
 		return nil
 	case "text/html", "application/xhtml+xml", "":
 	default:
@@ -587,7 +596,7 @@ func (d *Discoverer) readPage(e *Entry, res *fetch.Response) error {
 	if err != nil {
 		return err
 	}
-	e.Body, e.pageBody = capBody(sanitize.Text(string(md))), true
+	e.Body, e.pageBody, e.fetchedAt = capBody(sanitize.Text(string(md))), true, time.Now()
 	if e.Title == "" {
 		e.Title = sanitize.Line(article.Title())
 	}
@@ -607,7 +616,7 @@ func (d *Discoverer) readPage(e *Entry, res *fetch.Response) error {
 
 // reuse copies old's page content into e, keeping the feed's own fields.
 func reuse(e, old *Entry) {
-	e.Body, e.pageBody = old.Body, true
+	e.Body, e.pageBody, e.fetchedAt = old.Body, true, old.fetchedAt
 	// Feed entries are posts whatever the page looked like last time.
 	if !e.fromFeed {
 		e.Kind = old.Kind
@@ -659,7 +668,9 @@ func (d *Discoverer) loadSitemaps(ctx context.Context, roots []string, prev *Sit
 	visited := map[string]bool{}
 	cache := map[string]cachedSitemap{}
 	var out []sitemapURL
-	for len(queue) > 0 && len(visited) < maxFiles && len(out) < maxURLs {
+	// Every file is read before cutting to maxURLs, so the newest pages win
+	// even when they sit in the last of several sitemaps.
+	for len(queue) > 0 && len(visited) < maxFiles {
 		raw := queue[0]
 		queue = queue[1:]
 		if visited[raw] || strings.HasSuffix(raw, ".gz") {
@@ -709,10 +720,10 @@ func (d *Discoverer) loadSitemaps(ctx context.Context, roots []string, prev *Sit
 		}
 		out = append(out, c.pages...)
 	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].lastmod.After(out[j].lastmod) })
 	if len(out) > maxURLs {
 		out = out[:maxURLs]
 	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].lastmod.After(out[j].lastmod) })
 	return out, cache
 }
 

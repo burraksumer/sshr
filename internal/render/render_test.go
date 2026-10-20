@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/x/ansi"
 )
@@ -217,9 +218,9 @@ func TestDocCacheEvicts(t *testing.T) {
 	if _, ok := c.get(cacheKey{id: "a"}); !ok {
 		t.Error("recently used entry evicted")
 	}
-	c.put(cacheKey{id: "huge"}, doc(30), 0)
+	c.put(cacheKey{id: "huge"}, doc(50), 0)
 	if _, ok := c.get(cacheKey{id: "huge"}); ok {
-		t.Error("entry over a quarter of the cache was stored")
+		t.Error("entry over half the cache was stored")
 	}
 }
 
@@ -259,6 +260,31 @@ func TestCachedRendersOnce(t *testing.T) {
 	for i := range docs {
 		if docs[i].Content != docs[0].Content || docs[i].Content == "" {
 			t.Fatal("sessions got different renders")
+		}
+	}
+}
+
+// A render that panics releases sessions waiting on it, and later calls
+// for the same document don't block.
+func TestCachedPanicReleases(t *testing.T) {
+	old := renderMarkdown
+	defer func() { renderMarkdown = old }()
+	renderMarkdown = func(string, Options) (Document, error) { panic("boom") }
+	id := new(int)
+	for range 2 {
+		done := make(chan error, 1)
+		go func() {
+			defer func() { recover() }()
+			_, err := Cached(id, "x", Options{Width: 50})
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Error("no error from a panicking render")
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("Cached blocked after a panic")
 		}
 	}
 }

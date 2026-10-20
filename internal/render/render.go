@@ -20,9 +20,8 @@ import (
 
 // Link is a numbered link from a rendered document.
 type Link struct {
-	N    int
-	URL  string
-	Text string
+	N   int
+	URL string
 }
 
 // Document is rendered markdown and the links it contains.
@@ -116,7 +115,7 @@ func numberLinks(doc ast.Node, source []byte, base string) ([]byte, []Link) {
 		if !ok {
 			num = len(links) + 1
 			byURL[dest] = num
-			links = append(links, Link{N: num, URL: dest, Text: nodeText(l, source)})
+			links = append(links, Link{N: num, URL: dest})
 		}
 		// An anchor-only destination makes glamour render the text without
 		// printing the URL after it.
@@ -158,15 +157,4 @@ func appendText(source []byte, s string) ([]byte, *ast.Text) {
 	start := len(source)
 	source = append(source, s...)
 	return source, ast.NewTextSegment(text.NewSegment(start, len(source)))
-}
-
-func nodeText(n ast.Node, source []byte) string {
-	var b strings.Builder
-	_ = ast.Walk(n, func(c ast.Node, entering bool) (ast.WalkStatus, error) {
-		if t, ok := c.(*ast.Text); ok && entering {
-			b.Write(t.Segment.Value(source))
-		}
-		return ast.WalkContinue, nil
-	})
-	return b.String()
 }

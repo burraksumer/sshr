@@ -30,6 +30,8 @@ type Entry struct {
 	fromFeed bool
 	// pageBody means Body came from fetching the page, not from the feed.
 	pageBody bool
+	// fetchedAt is when the page was last fetched or confirmed unchanged.
+	fetchedAt time.Time
 }
 
 // Site is an immutable snapshot of a website's content. Sessions share it and

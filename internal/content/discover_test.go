@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -829,6 +830,8 @@ func TestScopeOfFileURL(t *testing.T) {
 		"https://x.example/blog/":          "/blog/",
 		"https://x.example/index.html":     "/",
 		"https://x.example/blog/index.php": "/blog/",
+		"https://x.example/~jane.doe":      "/~jane.doe/",
+		"https://x.example/docs/v2.0":      "/docs/v2.0/",
 	} {
 		u, _ := url.Parse(raw)
 		if got := (&Discoverer{Base: u}).scope(); got != want {
@@ -886,5 +889,53 @@ func TestHomepageOutageWhitespaceAndDedupe(t *testing.T) {
 	}
 	if second.Title != "Real Name" {
 		t.Errorf("title during homepage outage = %q", second.Title)
+	}
+}
+
+// With a budget too small for every page, refreshes rotate through the
+// pages, oldest copy first, instead of refetching the same ones.
+func TestPageBudgetRotates(t *testing.T) {
+	var mu sync.Mutex
+	hits := map[string]int{}
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("/feed.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/feed+json")
+		var items []string
+		for i := range 4 {
+			items = append(items, fmt.Sprintf(`{"id":"%d","url":"%s/p%d","title":"P%d","summary":"s"}`, i, srv.URL, i, i))
+		}
+		w.Write([]byte(`{"version":"https://jsonfeed.org/version/1.1","items":[` + strings.Join(items, ",") + `]}`))
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits[r.URL.Path]++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/markdown")
+		w.Write([]byte("body " + r.URL.Path + "\n"))
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+	base, _ := url.Parse(srv.URL + "/")
+	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Host}, Rate: 1000, Burst: 100}), Base: base}
+	site, err := d.Discover(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Mark p0..p3 as fetched at increasing times, then allow one fetch.
+	for i, p := range []string{"/p3", "/p1", "/p2", "/p0"} {
+		site.Lookup(srv.URL + p).fetchedAt = time.Unix(int64(i), 0)
+	}
+	mu.Lock()
+	clear(hits)
+	mu.Unlock()
+	d.PageBudget = time.Millisecond
+	if _, err := d.Discover(context.Background(), site, nil); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if hits["/p3"] != 1 {
+		t.Errorf("page hits = %v, want /p3, the oldest copy, fetched", hits)
 	}
 }

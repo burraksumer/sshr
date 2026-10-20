@@ -4,6 +4,7 @@
 package fetch
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -443,7 +444,11 @@ func (c *Client) do(ctx context.Context, u *url.URL, accept string, conditional 
 		if maxBytes > 0 {
 			return nil, nil, fmt.Errorf("fetch: %q is larger than %d bytes", u, limit)
 		}
+		// Cut at the last line break, so a rule isn't left half written.
 		body = body[:limit]
+		if i := bytes.LastIndexByte(body, '\n'); i >= 0 {
+			body = body[:i+1]
+		}
 	}
 	out.Body = body
 

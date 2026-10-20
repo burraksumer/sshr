@@ -2,6 +2,7 @@ package render
 
 import (
 	"container/list"
+	"fmt"
 	"sync"
 )
 
@@ -43,6 +44,9 @@ type render struct {
 
 var shared = newDocCache(cacheBytes)
 
+// renderMarkdown is Markdown, swappable in tests.
+var renderMarkdown = Markdown
+
 func newDocCache(maxBytes int) *docCache {
 	return &docCache{max: maxBytes, order: list.New(), items: map[cacheKey]*list.Element{}, inflight: map[cacheKey]*render{}}
 }
@@ -61,11 +65,11 @@ func (c *docCache) get(k cacheKey) (Document, bool) {
 func (c *docCache) put(k cacheKey, doc Document, extra int) {
 	size := len(doc.Content)
 	for _, l := range doc.Links {
-		size += len(l.URL) + len(l.Text)
+		size += len(l.URL)
 	}
 	size += extra
-	if size > c.max/4 {
-		return // too big to be worth holding
+	if size > c.max/2 {
+		return // too big to hold without pushing out everything else
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -86,12 +90,17 @@ func (c *docCache) put(k cacheKey, doc Document, extra int) {
 // Cached is Markdown with a cache shared by all callers. id names the
 // document, and must change whenever md does. A content entry pointer
 // works, since a refresh makes new entries.
-func Cached(id any, md string, opts Options) (Document, error) {
+func Cached(id any, md string, opts Options) (doc Document, err error) {
 	k := cacheKey{id: id, base: opts.BaseURL, width: opts.Width, dark: opts.Dark}
-	if doc, ok := shared.get(k); ok {
+	// Look in the cache and at renders in progress under one lock, so a
+	// render that finishes in between isn't done twice.
+	shared.mu.Lock()
+	if el, ok := shared.items[k]; ok {
+		shared.order.MoveToFront(el)
+		doc = el.Value.(*cacheEntry).doc
+		shared.mu.Unlock()
 		return doc, nil
 	}
-	shared.mu.Lock()
 	if r, ok := shared.inflight[k]; ok {
 		shared.mu.Unlock()
 		<-r.done
@@ -101,14 +110,21 @@ func Cached(id any, md string, opts Options) (Document, error) {
 	shared.inflight[k] = r
 	shared.mu.Unlock()
 
-	r.doc, r.err = Markdown(md, opts)
+	// Waiters must be released even if rendering panics.
+	defer func() {
+		if p := recover(); p != nil {
+			r.err = fmt.Errorf("render: panic: %v", p)
+			doc, err = Document{}, r.err
+		}
+		shared.mu.Lock()
+		delete(shared.inflight, k)
+		shared.mu.Unlock()
+		close(r.done)
+	}()
+	r.doc, r.err = renderMarkdown(md, opts)
 	if r.err == nil {
 		// The id keeps md alive while cached, so md counts too.
 		shared.put(k, r.doc, len(md))
 	}
-	shared.mu.Lock()
-	delete(shared.inflight, k)
-	shared.mu.Unlock()
-	close(r.done)
 	return r.doc, r.err
 }
