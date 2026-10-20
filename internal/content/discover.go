@@ -242,6 +242,11 @@ func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []feedLink,
 	// Advertised feeds first, then the common paths, in case the advertised
 	// ones are broken.
 	candidates := sortFeeds(links)
+	// The feed that worked last time is tried even when the homepage
+	// couldn't be read this round.
+	if prev != nil && prev.feedURL != "" && !slices.Contains(candidates, prev.feedURL) {
+		candidates = append([]string{prev.feedURL}, candidates...)
+	}
 	// A site that had no feed last time isn't probed at the common paths on
 	// every refresh, only every reprobeEvery refreshes.
 	if prev == nil || prev.feedURL != "" || prev.probeAge >= reprobeEvery {
@@ -267,7 +272,7 @@ func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []feedLink,
 		res, err := d.Client.GetLarge(ctx, u, acceptFeed, conditional)
 		if err != nil {
 			log.Debug("feed", "url", raw, "err", err)
-			if prev != nil && raw == prev.feedURL && !errors.Is(err, fetch.ErrDisallowed) && !errors.Is(err, fetch.ErrNotAllowed) {
+			if prev != nil && raw == prev.feedURL && !permanent(err) {
 				prevFailed = true
 			}
 			continue
@@ -349,6 +354,16 @@ func applyFeedMeta(site *Site, title, description string) {
 	if description != "" {
 		site.Description = description
 	}
+}
+
+// permanent reports whether a fetch error means the URL is off limits, as
+// opposed to failing for a moment. A robots.txt that can't be fetched right
+// now counts as a passing failure.
+func permanent(err error) bool {
+	if errors.Is(err, fetch.ErrRobotsUnavailable) {
+		return false
+	}
+	return errors.Is(err, fetch.ErrDisallowed) || errors.Is(err, fetch.ErrNotAllowed)
 }
 
 // transient reports whether an HTTP status is worth keeping old data over.
@@ -440,7 +455,7 @@ func (d *Discoverer) fillBody(ctx context.Context, e *Entry, old *Entry) error {
 	hasOld := old != nil && old.Body != ""
 	res, err := d.Client.Get(ctx, u, acceptPage, hasOld)
 	switch {
-	case err != nil && hasOld && !errors.Is(err, fetch.ErrDisallowed) && !errors.Is(err, fetch.ErrNotAllowed):
+	case err != nil && hasOld && !permanent(err):
 		// A timeout or connection error. Keep last refresh's copy rather
 		// than dropping the entry until the next refresh.
 		reuse(e, old)
@@ -567,7 +582,7 @@ func (d *Discoverer) loadSitemaps(ctx context.Context, roots []string, prev *Sit
 		res, err := d.Client.Get(ctx, u, acceptXML, hasOld)
 		var c cachedSitemap
 		switch {
-		case err != nil && hasOld && !errors.Is(err, fetch.ErrDisallowed) && !errors.Is(err, fetch.ErrNotAllowed):
+		case err != nil && hasOld && !permanent(err):
 			log.Debug("sitemap unavailable, keeping previous copy", "url", raw, "err", err)
 			c = old
 		case err != nil:
@@ -582,7 +597,7 @@ func (d *Discoverer) loadSitemaps(ctx context.Context, roots []string, prev *Sit
 			if err := xml.Unmarshal(res.Body, &doc); err != nil {
 				continue
 			}
-			c = parseSitemap(doc, res.URL, scope)
+			c = parseSitemap(doc, res.URL, scope, maxURLs)
 		}
 		cache[raw] = c
 		for _, child := range c.children {
@@ -591,6 +606,9 @@ func (d *Discoverer) loadSitemaps(ctx context.Context, roots []string, prev *Sit
 			}
 		}
 		out = append(out, c.pages...)
+	}
+	if len(out) > maxURLs {
+		out = out[:maxURLs]
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].lastmod.After(out[j].lastmod) })
 	return out, cache
@@ -605,7 +623,7 @@ type cachedSitemap struct {
 
 // parseSitemap resolves a sitemap's URLs against base and keeps child
 // sitemaps and the pages inside scope that look like pages, not files.
-func parseSitemap(doc sitemapDoc, base *url.URL, scope string) cachedSitemap {
+func parseSitemap(doc sitemapDoc, base *url.URL, scope string, limit int) cachedSitemap {
 	var c cachedSitemap
 	for _, s := range doc.Sitemaps {
 		if child, err := base.Parse(strings.TrimSpace(s.Loc)); err == nil {
@@ -613,6 +631,9 @@ func parseSitemap(doc sitemapDoc, base *url.URL, scope string) cachedSitemap {
 		}
 	}
 	for _, x := range doc.URLs {
+		if len(c.pages) >= limit {
+			break
+		}
 		loc, err := base.Parse(strings.TrimSpace(x.Loc))
 		if err != nil || !inScope(loc, scope) || !readablePath(loc.Path) {
 			continue
@@ -705,8 +726,12 @@ func isFeedType(t string) bool {
 func sortFeeds(links []feedLink) []string {
 	rank := func(t string) int {
 		switch t {
-		case "application/feed+json", "application/json":
+		case "application/feed+json":
 			return 0
+		case "application/json":
+			// Also used for things that aren't feeds, like WordPress's
+			// REST API link, so it goes last.
+			return 3
 		case "application/atom+xml":
 			return 1
 		}

@@ -316,6 +316,13 @@ func TestSubpathScope(t *testing.T) {
 
 // A page that answers 304 keeps the feed's date, and a server that answers
 // 304 without being asked doesn't crash discovery.
+func TestSortFeedsJSONLast(t *testing.T) {
+	got := sortFeeds([]feedLink{{"/api", "application/json"}, {"/rss", "application/rss+xml"}, {"/atom", "application/atom+xml"}, {"/jf", "application/feed+json"}})
+	if strings.Join(got, ",") != "/jf,/atom,/rss,/api" {
+		t.Errorf("sortFeeds = %v", got)
+	}
+}
+
 func TestPage304KeepsFeedDate(t *testing.T) {
 	var feedCalls atomic.Int32
 	mux := http.NewServeMux()
@@ -428,11 +435,15 @@ func TestFeedOrderAndType(t *testing.T) {
 	mux.HandleFunc("/{$}", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		w.Write([]byte(`<html><head>
+<link rel="alternate" type="application/json" href="/wp-json/wp/v2/pages/2">
 <link rel="alternate" type="application/rss+xml" href="/rss">
-<link rel="alternate" type="application/json" href="/feed/json/"></head></html>`))
+<link rel="alternate" type="application/feed+json" href="/feed/json/"></head></html>`))
 	})
 	mux.HandleFunc("/rss", func(w http.ResponseWriter, r *http.Request) {
 		t.Error("RSS fetched although a JSON Feed was advertised")
+	})
+	mux.HandleFunc("/wp-json/wp/v2/pages/2", func(w http.ResponseWriter, r *http.Request) {
+		t.Error("plain application/json link fetched before the real feed")
 	})
 	mux.HandleFunc("/feed/json/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -632,5 +643,77 @@ func TestPartialBeforeSitemaps(t *testing.T) {
 	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Host}, Rate: 1000, Burst: 100}), Base: base}
 	if _, err := d.Discover(context.Background(), nil, func(*Site) { published.Store(true) }); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// When the homepage can't be read, last refresh's feed is still tried, so
+// posts from a feed at an unusual path aren't lost.
+func TestFeedTriedWhenHomepageDown(t *testing.T) {
+	var homeDown atomic.Bool
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("/{$}", func(w http.ResponseWriter, r *http.Request) {
+		if homeDown.Load() {
+			http.Error(w, "down", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<html><head><link rel="alternate" type="application/rss+xml" href="/posts/index.rss"></head></html>`))
+	})
+	mux.HandleFunc("/posts/index.rss", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`<?xml version="1.0"?><rss version="2.0"><channel><title>T</title><item><title>P</title>
+<link>` + srv.URL + `/p</link><content:encoded xmlns:content="http://purl.org/rss/1.0/modules/content/">Body</content:encoded></item></channel></rss>`))
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+	base, _ := url.Parse(srv.URL + "/")
+	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Host}, Rate: 1000, Burst: 100}), Base: base}
+	first, err := d.Discover(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	homeDown.Store(true)
+	second, err := d.Discover(context.Background(), first, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Lookup(srv.URL+"/p") == nil {
+		t.Error("post lost while the homepage was down")
+	}
+}
+
+// A robots.txt outage on a page's host keeps last refresh's copy.
+func TestRobotsOutageKeepsPage(t *testing.T) {
+	var robotsDown atomic.Bool
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) {
+		if robotsDown.Load() {
+			http.Error(w, "down", http.StatusBadGateway)
+		}
+	})
+	mux.HandleFunc("/feed.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/feed+json")
+		w.Write([]byte(`{"version":"https://jsonfeed.org/version/1.1","items":[{"id":"1","url":"` + srv.URL + `/p","title":"P","summary":"s"}]}`))
+	})
+	mux.HandleFunc("/p", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/markdown")
+		w.Write([]byte("Post body\n"))
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+	base, _ := url.Parse(srv.URL + "/")
+	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Host}, Rate: 1000, Burst: 100}), Base: base}
+	first, err := d.Discover(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	robotsDown.Store(true)
+	second, err := d.Discover(context.Background(), first, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e := second.Lookup(srv.URL + "/p"); e == nil || !strings.Contains(e.Body, "Post body") {
+		t.Errorf("post lost during a robots.txt outage: %+v", e)
 	}
 }

@@ -31,6 +31,10 @@ var (
 	ErrNotAllowed = errors.New("fetch: host not allowed")
 	// ErrDisallowed means robots.txt asks sshr not to fetch the URL.
 	ErrDisallowed = errors.New("fetch: disallowed by robots.txt")
+	// ErrRobotsUnavailable comes wrapped with ErrDisallowed when the reason
+	// is that robots.txt couldn't be fetched this round. Callers may treat it
+	// as a passing outage.
+	ErrRobotsUnavailable = errors.New("fetch: robots.txt unavailable")
 )
 
 // Options configures a Client.
@@ -84,8 +88,11 @@ type Client struct {
 }
 
 type robotsEntry struct {
-	data  *robotstxt.RobotsData
-	round int
+	data *robotstxt.RobotsData
+	// unavailable means robots.txt failed with a network error or a 5xx,
+	// and data disallows everything for that reason.
+	unavailable bool
+	round       int
 }
 
 // disallowAll is used when robots.txt can't be fetched. RFC 9309 treats an
@@ -139,8 +146,10 @@ func New(opts Options) *Client {
 			if err := c.checkURL(req.URL); err != nil {
 				return err
 			}
-			if req.Context().Value(skipRobots{}) == nil && !c.robotsAllow(req.Context(), req.URL) {
-				return fmt.Errorf("%w: redirect to %q", ErrDisallowed, req.URL)
+			if req.Context().Value(skipRobots{}) == nil {
+				if allowed, unavailable := c.robotsAllow(req.Context(), req.URL); !allowed {
+					return robotsError(req.URL, unavailable)
+				}
 			}
 			return nil
 		},
@@ -171,7 +180,11 @@ func (c *Client) EndRound() {
 // Allowed reports whether u is on the allowlist and not blocked by its host's
 // robots.txt, which it fetches if needed.
 func (c *Client) Allowed(ctx context.Context, u *url.URL) bool {
-	return c.checkURL(u) == nil && c.robotsAllow(ctx, u)
+	if c.checkURL(u) != nil {
+		return false
+	}
+	allowed, _ := c.robotsAllow(ctx, u)
+	return allowed
 }
 
 func (c *Client) checkURL(u *url.URL) error {
@@ -188,6 +201,13 @@ func (c *Client) checkURL(u *url.URL) error {
 	return nil
 }
 
+func robotsError(u *url.URL, unavailable bool) error {
+	if unavailable {
+		return fmt.Errorf("%w: %w: %q", ErrDisallowed, ErrRobotsUnavailable, u)
+	}
+	return fmt.Errorf("%w: %q", ErrDisallowed, u)
+}
+
 // origin identifies whose robots.txt applies to u.
 func origin(u *url.URL) string {
 	return strings.ToLower(u.Scheme + "://" + u.Host)
@@ -195,14 +215,14 @@ func origin(u *url.URL) string {
 
 // robotsFor returns the robots.txt rules for u's origin, fetching them once
 // per round.
-func (c *Client) robotsFor(ctx context.Context, u *url.URL) *robotstxt.RobotsData {
+func (c *Client) robotsFor(ctx context.Context, u *url.URL) robotsEntry {
 	key := origin(u)
 	c.mu.Lock()
 	e, ok := c.robots[key]
 	round := c.round
 	c.mu.Unlock()
 	if ok && e.round == round {
-		return e.data
+		return e
 	}
 	c.robotsMu.Lock()
 	defer c.robotsMu.Unlock()
@@ -210,38 +230,44 @@ func (c *Client) robotsFor(ctx context.Context, u *url.URL) *robotstxt.RobotsDat
 	e, ok = c.robots[key]
 	c.mu.Unlock()
 	if ok && e.round == round {
-		return e.data
+		return e
 	}
-	data, _ := c.fetchRobots(ctx, u)
-	return data
+	e, _ = c.fetchRobots(ctx, u)
+	return e
 }
 
 // fetchRobots fetches and stores robots.txt for u's origin.
-func (c *Client) fetchRobots(ctx context.Context, u *url.URL) (*robotstxt.RobotsData, error) {
+func (c *Client) fetchRobots(ctx context.Context, u *url.URL) (robotsEntry, error) {
 	ru := u.ResolveReference(&url.URL{Path: "/robots.txt"})
-	data := disallowAll
+	e := robotsEntry{data: disallowAll, unavailable: true}
 	resp, err := c.get(context.WithValue(ctx, skipRobots{}, true), ru, "text/plain", false, false, c.maxBytes)
-	if errors.Is(err, ErrNotAllowed) {
+	switch {
+	case errors.Is(err, ErrNotAllowed):
 		// robots.txt redirects to a host sshr won't contact, like a CDN.
 		// RFC 9309 treats a robots.txt that can't be followed as missing,
 		// which allows everything. Only network errors and 5xx disallow.
-		data, _ = robotstxt.FromStatusAndBytes(http.StatusNotFound, nil)
-	} else if err == nil {
-		var perr error
-		data, perr = robotstxt.FromStatusAndBytes(resp.Status, resp.Body)
+		e.data, _ = robotstxt.FromStatusAndBytes(http.StatusNotFound, nil)
+		e.unavailable, err = false, nil
+	case err == nil:
+		data, perr := robotstxt.FromStatusAndBytes(resp.Status, resp.Body)
 		if perr != nil {
 			// An unparseable file is treated like a missing one.
 			data, _ = robotstxt.FromStatusAndBytes(http.StatusNotFound, nil)
 		}
+		e.data, e.unavailable = data, resp.Status >= 500
 	}
 	c.mu.Lock()
-	c.robots[origin(u)] = robotsEntry{data: data, round: c.round}
+	e.round = c.round
+	c.robots[origin(u)] = e
 	c.mu.Unlock()
-	return data, err
+	return e, err
 }
 
-func (c *Client) robotsAllow(ctx context.Context, u *url.URL) bool {
-	data := c.robotsFor(ctx, u)
+// robotsAllow reports whether robots.txt for u's origin allows u, and whether
+// a refusal is only because robots.txt is unavailable right now.
+func (c *Client) robotsAllow(ctx context.Context, u *url.URL) (allowed, unavailable bool) {
+	e := c.robotsFor(ctx, u)
+	data := e.data
 	p := u.EscapedPath()
 	if p == "" {
 		p = "/"
@@ -249,7 +275,10 @@ func (c *Client) robotsAllow(ctx context.Context, u *url.URL) bool {
 	if u.RawQuery != "" {
 		p += "?" + u.RawQuery
 	}
-	return data.TestAgent(p, robotsAgent)
+	if data.TestAgent(p, robotsAgent) {
+		return true, false
+	}
+	return false, e.unavailable
 }
 
 // LoadRobots fetches robots.txt for the site's own origin, applies its
@@ -258,11 +287,12 @@ func (c *Client) robotsAllow(ctx context.Context, u *url.URL) bool {
 // LoadRobots returns the error.
 func (c *Client) LoadRobots(ctx context.Context, base *url.URL) ([]string, error) {
 	c.robotsMu.Lock()
-	data, err := c.fetchRobots(ctx, base)
+	e, err := c.fetchRobots(ctx, base)
 	c.robotsMu.Unlock()
 	if err != nil {
 		return nil, err
 	}
+	data := e.data
 	if g := data.FindGroup(robotsAgent); g != nil && g.CrawlDelay > 0 {
 		c.limiter.SetLimit(min(rate.Every(g.CrawlDelay), c.rate))
 		c.limiter.SetBurst(1)
@@ -289,8 +319,10 @@ func (c *Client) get(ctx context.Context, u *url.URL, accept string, conditional
 	if err := c.checkURL(u); err != nil {
 		return nil, err
 	}
-	if checkRobots && !c.robotsAllow(ctx, u) {
-		return nil, fmt.Errorf("%w: %s", ErrDisallowed, u)
+	if checkRobots {
+		if allowed, unavailable := c.robotsAllow(ctx, u); !allowed {
+			return nil, robotsError(u, unavailable)
+		}
 	}
 	if err := c.limiter.Wait(ctx); err != nil {
 		return nil, err

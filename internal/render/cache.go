@@ -49,7 +49,8 @@ func (c *docCache) get(k cacheKey) (Document, bool) {
 }
 
 func (c *docCache) put(k cacheKey, doc Document) {
-	size := len(doc.Content)
+	// The key holds the markdown, which keeps it alive, so it counts too.
+	size := len(k.md) + len(doc.Content)
 	for _, l := range doc.Links {
 		size += len(l.URL) + len(l.Text)
 	}

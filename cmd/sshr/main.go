@@ -120,10 +120,9 @@ func read(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(os.Stderr, "Reading", cfg.URL, "…")
-	if err := store.Refresh(ctx); err != nil {
-		return err
-	}
+	// The reader shows a loading screen and picks up posts as soon as the
+	// first ones are ready, so the refresh runs alongside it.
+	go store.Run(ctx, cfg.Refresh.D())
 	_, err = tea.NewProgram(ui.New(store), tea.WithContext(ctx)).Run()
 	if errors.Is(err, tea.ErrProgramKilled) || errors.Is(err, context.Canceled) {
 		return nil

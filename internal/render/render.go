@@ -58,13 +58,14 @@ func Markdown(md string, opts Options) (Document, error) {
 	)
 	source := []byte(md)
 	doc := gm.Parser().Parse(text.NewReader(source))
-	source = cleanTree(doc, source)
-
+	// Number links first, so a strikethrough that cleanTree flattens keeps
+	// the [n] markers of the links inside it.
 	var links []Link
 	source, links = numberLinks(doc, source, opts.BaseURL)
 	if len(links) > 0 {
 		appendLinkList(doc, &source, links)
 	}
+	source = cleanTree(doc, source)
 
 	r := renderer.NewRenderer(renderer.WithNodeRenderers(util.Prioritized(ansi.NewRenderer(ansi.Options{
 		BaseURL:  opts.BaseURL,

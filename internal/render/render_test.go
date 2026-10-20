@@ -221,3 +221,13 @@ func TestDocCacheEvicts(t *testing.T) {
 		t.Error("entry over a quarter of the cache was stored")
 	}
 }
+
+func TestLinksInStrikethroughNumbered(t *testing.T) {
+	doc, err := Markdown("~~see [the old docs](https://example.com/v1)~~", Options{Width: 80})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Links) != 1 || !strings.Contains(ansi.Strip(doc.Content), "the old docs [1]") {
+		t.Errorf("links %+v, content:\n%s", doc.Links, ansi.Strip(doc.Content))
+	}
+}
