@@ -247,3 +247,46 @@ func TestParseHost(t *testing.T) {
 		}
 	}
 }
+
+// A page in windows-1254, as many Turkish sites use, comes back as UTF-8.
+func TestCharsetToUTF8(t *testing.T) {
+	// "Çay ğüşı" in windows-1254.
+	body := []byte{0xC7, 'a', 'y', ' ', 0xF0, 0xFC, 0xFE, 0xFD}
+	srv, c := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=windows-1254")
+		w.Write(append([]byte("<p>"), append(body, []byte("</p>")...)...))
+	})
+	res, err := c.Get(context.Background(), mustURL(t, srv.URL+"/"), "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(res.Body), "Çay ğüşı") {
+		t.Errorf("body = %q", res.Body)
+	}
+}
+
+// Validators for a redirect target aren't sent when the caller asked for
+// the redirecting URL, so its stale copy isn't kept by a 304 meant for the
+// target.
+func TestNoValidatorsOnLaterHops(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/old", func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, "/new", http.StatusMovedPermanently) })
+	mux.HandleFunc("/new", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"n"`)
+		if r.Header.Get("If-None-Match") == `"n"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Write([]byte("new page"))
+	})
+	srv, c := testServer(t, mux.ServeHTTP)
+	ctx := context.Background()
+	c.Get(ctx, mustURL(t, srv.URL+"/new"), "", false) // stores /new's ETag
+	res, err := c.Get(ctx, mustURL(t, srv.URL+"/old"), "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.NotModified || string(res.Body) != "new page" {
+		t.Errorf("got 304 = %v, body %q, want the full new page", res.NotModified, res.Body)
+	}
+}

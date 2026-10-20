@@ -171,7 +171,13 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 	if len(entries) > maxEntries {
 		entries = entries[:maxEntries]
 	}
-	feedEntries := slices.Clone(entries)
+	// feedEntries keeps what the feed said. Copies, so titles and dates
+	// that page fetches fill in below don't end up in it.
+	feedEntries := make([]*Entry, len(entries))
+	for i, e := range entries {
+		c := *e
+		feedEntries[i] = &c
+	}
 
 	// Posts that came with full content can be shown before sitemaps and
 	// pages are fetched, which can take minutes on a slow site.
@@ -225,6 +231,10 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 
 	d.fillBodies(ctx, entries, prev, log)
 	site.feedEntries = feedEntries
+	// Pages kept from last round without a request keep their validators.
+	for _, e := range entries {
+		d.Client.Keep(e.URL)
+	}
 
 	var kept []*Entry
 	for _, e := range entries {
@@ -272,9 +282,10 @@ func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []feedLink,
 	// ones are broken.
 	candidates := sortFeeds(links)
 	// The feed that worked last time is tried even when the homepage
-	// couldn't be read this round.
+	// couldn't be read this round, but after any feeds the homepage
+	// advertises, which may have become better.
 	if prev != nil && prev.feedURL != "" && !slices.Contains(candidates, prev.feedURL) {
-		candidates = append([]string{prev.feedURL}, candidates...)
+		candidates = append(candidates, prev.feedURL)
 	}
 	// A site that had no feed last time isn't probed at the common paths on
 	// every refresh, only every reprobeEvery refreshes.
@@ -362,6 +373,11 @@ func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []feedLink,
 	if prevFailed && prev.feedEntries != nil {
 		log.Warn("feed unavailable, keeping previous entries", "url", prev.feedURL)
 		return reuseFeed(site, prev), prev.feedURL
+	}
+	// The feed went away, for good or for a moment. Probe the common paths
+	// again next refresh instead of waiting reprobeEvery refreshes.
+	if prev != nil && prev.feedURL != "" {
+		site.probeAge = reprobeEvery
 	}
 	return nil, ""
 }

@@ -54,12 +54,34 @@ func newDocCache(maxBytes int) *docCache {
 func (c *docCache) get(k cacheKey) (Document, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.getLocked(k)
+}
+
+func (c *docCache) getLocked(k cacheKey) (Document, bool) {
 	el, ok := c.items[k]
 	if !ok {
 		return Document{}, false
 	}
 	c.order.MoveToFront(el)
 	return el.Value.(*cacheEntry).doc, true
+}
+
+// claim looks up k in the cache and in renders in progress, under one lock
+// so a render that finishes in between isn't done twice. It returns the
+// cached document with a nil render, or a render to wait for, or a new
+// render the caller must do, with mine set.
+func (c *docCache) claim(k cacheKey) (doc Document, r *render, mine bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if doc, ok := c.getLocked(k); ok {
+		return doc, nil, false
+	}
+	if r, ok := c.inflight[k]; ok {
+		return Document{}, r, false
+	}
+	r = &render{done: make(chan struct{})}
+	c.inflight[k] = r
+	return Document{}, r, true
 }
 
 func (c *docCache) put(k cacheKey, doc Document, extra int) {
@@ -92,23 +114,14 @@ func (c *docCache) put(k cacheKey, doc Document, extra int) {
 // works, since a refresh makes new entries.
 func Cached(id any, md string, opts Options) (doc Document, err error) {
 	k := cacheKey{id: id, base: opts.BaseURL, width: opts.Width, dark: opts.Dark}
-	// Look in the cache and at renders in progress under one lock, so a
-	// render that finishes in between isn't done twice.
-	shared.mu.Lock()
-	if el, ok := shared.items[k]; ok {
-		shared.order.MoveToFront(el)
-		doc = el.Value.(*cacheEntry).doc
-		shared.mu.Unlock()
-		return doc, nil
-	}
-	if r, ok := shared.inflight[k]; ok {
-		shared.mu.Unlock()
+	cached, r, mine := shared.claim(k)
+	switch {
+	case r == nil:
+		return cached, nil
+	case !mine:
 		<-r.done
 		return r.doc, r.err
 	}
-	r := &render{done: make(chan struct{})}
-	shared.inflight[k] = r
-	shared.mu.Unlock()
 
 	// Waiters must be released even if rendering panics.
 	defer func() {

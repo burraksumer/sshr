@@ -23,6 +23,9 @@ import (
 
 var version = "dev"
 
+// errReported means the error was already printed, so main only exits.
+var errReported = errors.New("already reported")
+
 const usage = `sshr serves a website's content as a terminal reader over SSH.
 
 Usage:
@@ -55,6 +58,9 @@ func main() {
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", cmd, usage)
 		os.Exit(2)
+	}
+	if errors.Is(err, errReported) {
+		os.Exit(1)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "sshr:", err)
@@ -142,7 +148,8 @@ func check(ctx context.Context, args []string) error {
 	}
 	start := time.Now()
 	if err := store.Refresh(ctx); err != nil {
-		return err
+		// The store's logger already printed it.
+		return errReported
 	}
 	site, _ := store.Site()
 	fmt.Printf("%s\n%s\n%d entries in %s\n\n", site.Title, site.Description, len(site.Entries), time.Since(start).Round(time.Millisecond))

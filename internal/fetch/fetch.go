@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/temoto/robotstxt"
+	"golang.org/x/net/html/charset"
 	"golang.org/x/time/rate"
 )
 
@@ -158,6 +159,17 @@ func (c *Client) StartRound() {
 	c.mu.Lock()
 	c.round++
 	c.mu.Unlock()
+}
+
+// Keep marks validators for rawURL as used this round, for URLs whose
+// earlier copy is kept without a request, so EndRound doesn't drop them.
+func (c *Client) Keep(rawURL string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if v, ok := c.validators[rawURL]; ok {
+		v.round = c.round
+		c.validators[rawURL] = v
+	}
 }
 
 // EndRound drops validators for URLs not requested since StartRound.
@@ -359,7 +371,10 @@ func (c *Client) get(ctx context.Context, u *url.URL, accept string, conditional
 		if err := c.limiter.Wait(ctx); err != nil {
 			return nil, err
 		}
-		res, next, err := c.do(ctx, u, accept, conditional, maxBytes)
+		// Validators only go with the URL the caller asked for. A later hop
+		// may be a different page with its own validators, and a 304 for
+		// it would make the caller keep a stale copy.
+		res, next, err := c.do(ctx, u, accept, conditional && hop == 0, maxBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -368,6 +383,27 @@ func (c *Client) get(ctx context.Context, u *url.URL, accept string, conditional
 		}
 		u = next
 	}
+}
+
+// toUTF8 converts HTML, markdown and plain text in another charset, like
+// windows-1254 or ISO-8859-9, to UTF-8. The charset comes from the
+// Content-Type header or, for HTML, a meta tag. XML feeds and sitemaps are
+// left to their parsers, which handle encodings themselves.
+func toUTF8(body []byte, mediaType, header string) []byte {
+	switch mediaType {
+	case "text/html", "application/xhtml+xml", "text/markdown", "text/x-markdown", "text/plain", "":
+	default:
+		return body
+	}
+	r, err := charset.NewReader(bytes.NewReader(body), header)
+	if err != nil {
+		return body
+	}
+	out, err := io.ReadAll(r)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 const maxRedirects = 5
@@ -450,7 +486,7 @@ func (c *Client) do(ctx context.Context, u *url.URL, accept string, conditional 
 			body = body[:i+1]
 		}
 	}
-	out.Body = body
+	out.Body = toUTF8(body, out.ContentType, res.Header.Get("Content-Type"))
 
 	if res.StatusCode == http.StatusOK {
 		v := validators{etag: res.Header.Get("ETag"), lastModified: res.Header.Get("Last-Modified")}

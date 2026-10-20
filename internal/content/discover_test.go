@@ -939,3 +939,49 @@ func TestPageBudgetRotates(t *testing.T) {
 		t.Errorf("page hits = %v, want /p3, the oldest copy, fetched", hits)
 	}
 }
+
+// A title that a page fetch fills in for an untitled feed item stays out of
+// the saved feed entries, and a feed that disappears gets the common paths
+// probed again on the next refresh.
+func TestFeedEntriesKeepFeedFields(t *testing.T) {
+	var gone atomic.Bool
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("/feed.xml", func(w http.ResponseWriter, r *http.Request) {
+		if gone.Load() {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write([]byte(`<?xml version="1.0"?><rss version="2.0"><channel><title>T</title><item>
+<link>` + srv.URL + `/untitled</link><description>s</description></item></channel></rss>`))
+	})
+	mux.HandleFunc("/untitled", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/markdown")
+		w.Write([]byte("# From the page\n\nBody\n"))
+	})
+	mux.HandleFunc("/sitemap.xml", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`<?xml version="1.0"?><urlset><url><loc>/untitled</loc></url></urlset>`))
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+	base, _ := url.Parse(srv.URL + "/")
+	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Host}, Rate: 1000, Burst: 100}), Base: base}
+	site, err := d.Discover(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if site.Lookup(srv.URL+"/untitled").Title != "From the page" {
+		t.Fatalf("title = %q", site.Lookup(srv.URL+"/untitled").Title)
+	}
+	if site.feedEntries[0].Title != "" {
+		t.Errorf("page title leaked into the feed entry: %q", site.feedEntries[0].Title)
+	}
+	gone.Store(true)
+	next, err := d.Discover(context.Background(), site, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.probeAge != reprobeEvery {
+		t.Errorf("probeAge after losing the feed = %d, want %d", next.probeAge, reprobeEvery)
+	}
+}
