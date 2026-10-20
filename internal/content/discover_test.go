@@ -821,3 +821,70 @@ func TestPageBudgetAndKind(t *testing.T) {
 		t.Errorf("entry past the budget = %+v", e)
 	}
 }
+
+func TestScopeOfFileURL(t *testing.T) {
+	for raw, want := range map[string]string{
+		"https://x.example/":               "/",
+		"https://x.example/blog":           "/blog/",
+		"https://x.example/blog/":          "/blog/",
+		"https://x.example/index.html":     "/",
+		"https://x.example/blog/index.php": "/blog/",
+	} {
+		u, _ := url.Parse(raw)
+		if got := (&Discoverer{Base: u}).scope(); got != want {
+			t.Errorf("scope(%s) = %q, want %q", raw, got, want)
+		}
+	}
+}
+
+// A homepage outage keeps the site's name, a whitespace-only feed body is
+// fetched from the page, and a URL in both feed and sitemap with non-ASCII
+// in its query shows up once.
+func TestHomepageOutageWhitespaceAndDedupe(t *testing.T) {
+	var homeDown atomic.Bool
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("/{$}", func(w http.ResponseWriter, r *http.Request) {
+		if homeDown.Load() {
+			http.Error(w, "down", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<html><head><title>Real Name</title></head></html>`))
+	})
+	mux.HandleFunc("/feed.xml", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`<?xml version="1.0"?><rss version="2.0"><channel>
+<item><title>Blank</title><link>` + srv.URL + `/blank</link><content:encoded xmlns:content="http://purl.org/rss/1.0/modules/content/"><![CDATA[<p>&nbsp;</p>]]></content:encoded></item>
+<item><title>Q</title><link>` + srv.URL + `/?p=ü</link><content:encoded xmlns:content="http://purl.org/rss/1.0/modules/content/">q body</content:encoded></item>
+</channel></rss>`))
+	})
+	mux.HandleFunc("/sitemap.xml", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`<?xml version="1.0"?><urlset><url><loc>` + srv.URL + `/?p=ü</loc></url></urlset>`))
+	})
+	mux.HandleFunc("/blank", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/markdown")
+		w.Write([]byte("Real body\n"))
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+	base, _ := url.Parse(srv.URL + "/")
+	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Host}, Rate: 1000, Burst: 100}), Base: base}
+	first, err := d.Discover(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e := first.Lookup(srv.URL + "/blank"); e == nil || !strings.Contains(e.Body, "Real body") {
+		t.Errorf("whitespace-only body not fetched: %+v", e)
+	}
+	if len(first.Entries) != 2 {
+		t.Errorf("got %d entries, want 2 with the feed and sitemap URL merged", len(first.Entries))
+	}
+	homeDown.Store(true)
+	second, err := d.Discover(context.Background(), first, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Title != "Real Name" {
+		t.Errorf("title during homepage outage = %q", second.Title)
+	}
+}

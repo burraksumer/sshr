@@ -7,12 +7,12 @@ import (
 	"net"
 	"net/url"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/burraksumer/sshr/internal/content"
+	"github.com/burraksumer/sshr/internal/fetch"
 )
 
 // Config is the full sshr configuration. Only URL is required.
@@ -186,27 +186,10 @@ func (c Config) Hosts(site *url.URL) []string {
 	return hosts
 }
 
-const hostFormat = "should be a host like cdn.example.com or cdn.example.com:8443, without a scheme or path"
-
 // checkHost accepts "host" or "host:port", without a scheme or path.
 func checkHost(h string) error {
-	h = strings.TrimSpace(h)
-	if strings.ContainsAny(h, "/@?# ") {
-		return fmt.Errorf("%q %s", h, hostFormat)
-	}
-	host, port, err := net.SplitHostPort(h)
-	if err != nil {
-		host, port = strings.Trim(h, "[]"), ""
-	}
-	if host == "" || strings.ContainsAny(host, "/:@?#% ") && net.ParseIP(host) == nil {
-		return fmt.Errorf("%q %s", h, hostFormat)
-	}
-	if err == nil {
-		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
-			return fmt.Errorf("%q has an invalid port", h)
-		}
-	}
-	return nil
+	_, _, err := fetch.ParseHost(h)
+	return err
 }
 
 // Duration is a time.Duration that reads from TOML strings like "15m".

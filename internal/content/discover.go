@@ -72,6 +72,10 @@ const reprobeEvery = 24
 // "/blog/" when the site URL is example.com/blog.
 func (d *Discoverer) scope() string {
 	p := d.Base.Path
+	// A URL that names a file, like /blog/index.html, means its directory.
+	if path.Ext(p) != "" {
+		p = path.Dir(p)
+	}
 	if !strings.HasSuffix(p, "/") {
 		p += "/"
 	}
@@ -132,9 +136,16 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 
 	site := &Site{URL: d.Base.String(), Title: d.Base.Hostname(), robotsSitemaps: sitemaps}
 	var feedLinks []feedLink
-	if res, err := d.Client.Get(ctx, d.Base, acceptHTML, false); err != nil {
-		log.Warn("homepage", "err", err)
-	} else if res.Status == 200 {
+	if res, err := d.Client.Get(ctx, d.Base, acceptHTML, false); err != nil || res.Status != 200 {
+		if err != nil {
+			log.Warn("homepage", "err", err)
+		}
+		// Keep last round's title and description rather than showing the
+		// bare host name while the homepage is down.
+		if prev != nil {
+			site.Title, site.Description = prev.Title, prev.Description
+		}
+	} else {
 		meta := parseHead(res.Body)
 		if meta.title != "" {
 			site.Title = meta.title
@@ -195,7 +206,12 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 			if room == 0 {
 				break
 			}
-			key := normalize(p.loc)
+			// Encoded like feed entry URLs, so the same URL matches.
+			loc, err := url.Parse(sanitize.URL(p.loc.String()))
+			if err != nil {
+				continue
+			}
+			key := normalize(loc)
 			if seen[key] || !d.Client.MayFetch(ctx, p.loc) {
 				continue
 			}
@@ -461,11 +477,24 @@ func (d *Discoverer) fillBodies(ctx context.Context, entries []*Entry, prev *Sit
 			}
 		})
 	}
-	skipped := 0
+	// Entries with no earlier copy go first, so a budget that runs out
+	// doesn't keep skipping the same new entries every refresh.
+	var todo []*Entry
 	for _, e := range entries {
-		if e.Body != "" || e.URL == "" {
-			continue
+		if strings.TrimSpace(e.Body) == "" && e.URL != "" {
+			todo = append(todo, e)
 		}
+	}
+	hasOld := func(e *Entry) bool {
+		if prev == nil {
+			return false
+		}
+		old := prev.Lookup(e.URL)
+		return old != nil && old.Body != ""
+	}
+	sort.SliceStable(todo, func(i, j int) bool { return !hasOld(todo[i]) && hasOld(todo[j]) })
+	skipped := 0
+	for _, e := range todo {
 		// Past the budget, entries keep last refresh's copy, if there is
 		// one, and get fetched in a later refresh.
 		if time.Now().After(deadline) {

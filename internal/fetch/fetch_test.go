@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -207,5 +208,42 @@ func TestRobotsRedirectLoopAllows(t *testing.T) {
 	c.LoadRobots(context.Background(), mustURL(t, srv.URL))
 	if _, err := c.Get(context.Background(), mustURL(t, srv.URL+"/page"), "", false); err != nil {
 		t.Errorf("err = %v, want the page allowed after a robots.txt redirect loop", err)
+	}
+}
+
+// A robots.txt over the read limit is cut, not treated as unreachable.
+func TestLargeRobotsTruncated(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("User-agent: *\nDisallow: /private\n"))
+		w.Write([]byte("# " + strings.Repeat("x", 6<<20) + "\n"))
+	})
+	mux.HandleFunc("/page", func(w http.ResponseWriter, r *http.Request) {})
+	srv, c := testServer(t, mux.ServeHTTP)
+	if _, err := c.LoadRobots(context.Background(), mustURL(t, srv.URL)); err != nil {
+		t.Fatalf("LoadRobots: %v", err)
+	}
+	if _, err := c.Get(context.Background(), mustURL(t, srv.URL+"/page"), "", false); err != nil {
+		t.Errorf("page blocked: %v", err)
+	}
+	if _, err := c.Get(context.Background(), mustURL(t, srv.URL+"/private"), "", false); !errors.Is(err, ErrDisallowed) {
+		t.Errorf("rules from the first part ignored: %v", err)
+	}
+}
+
+func TestParseHost(t *testing.T) {
+	for in, want := range map[string]string{
+		"CDN.example.com": "cdn.example.com 80,443", "cdn.example.com:8443": "cdn.example.com 8443",
+		"[::1]:9000": "::1 9000", "192.0.2.1": "192.0.2.1 80,443",
+	} {
+		h, ports, err := ParseHost(in)
+		if got := h + " " + strings.Join(ports, ","); err != nil || got != want {
+			t.Errorf("ParseHost(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+	for _, bad := range []string{"https://x", "x/y", "x:", "x:0", ""} {
+		if _, _, err := ParseHost(bad); err == nil {
+			t.Errorf("ParseHost(%q): no error", bad)
+		}
 	}
 }

@@ -30,12 +30,21 @@ type docCache struct {
 	size  int
 	order *list.List // front is most recently used
 	items map[cacheKey]*list.Element
+	// inflight holds renders in progress, so sessions that ask for the
+	// same document at once wait for one render instead of each doing it.
+	inflight map[cacheKey]*render
+}
+
+type render struct {
+	done chan struct{}
+	doc  Document
+	err  error
 }
 
 var shared = newDocCache(cacheBytes)
 
 func newDocCache(maxBytes int) *docCache {
-	return &docCache{max: maxBytes, order: list.New(), items: map[cacheKey]*list.Element{}}
+	return &docCache{max: maxBytes, order: list.New(), items: map[cacheKey]*list.Element{}, inflight: map[cacheKey]*render{}}
 }
 
 func (c *docCache) get(k cacheKey) (Document, bool) {
@@ -82,10 +91,24 @@ func Cached(id any, md string, opts Options) (Document, error) {
 	if doc, ok := shared.get(k); ok {
 		return doc, nil
 	}
-	doc, err := Markdown(md, opts)
-	if err == nil {
-		// The id keeps md alive while cached, so md counts too.
-		shared.put(k, doc, len(md))
+	shared.mu.Lock()
+	if r, ok := shared.inflight[k]; ok {
+		shared.mu.Unlock()
+		<-r.done
+		return r.doc, r.err
 	}
-	return doc, err
+	r := &render{done: make(chan struct{})}
+	shared.inflight[k] = r
+	shared.mu.Unlock()
+
+	r.doc, r.err = Markdown(md, opts)
+	if r.err == nil {
+		// The id keeps md alive while cached, so md counts too.
+		shared.put(k, r.doc, len(md))
+	}
+	shared.mu.Lock()
+	delete(shared.inflight, k)
+	shared.mu.Unlock()
+	close(r.done)
+	return r.doc, r.err
 }

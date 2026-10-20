@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +20,10 @@ import (
 	"github.com/temoto/robotstxt"
 	"golang.org/x/time/rate"
 )
+
+// maxRobotsBytes is how much of a robots.txt is read. RFC 9309 asks
+// crawlers to parse at least 500 KiB and ignore the rest.
+const maxRobotsBytes = 512 << 10
 
 // MaxCrawlDelay caps the Crawl-delay sshr honors. Longer delays would make a
 // refresh of a few hundred pages take hours.
@@ -129,14 +134,13 @@ func New(opts Options) *Client {
 		validators: map[string]validators{},
 	}
 	for _, h := range opts.Hosts {
-		h = strings.ToLower(strings.TrimSpace(h))
-		if host, port, err := net.SplitHostPort(h); err == nil {
-			c.hosts[net.JoinHostPort(host, port)] = true
-			continue
+		host, ports, err := ParseHost(h)
+		if err != nil {
+			continue // config validation reports these
 		}
-		h = strings.Trim(h, "[]")
-		c.hosts[net.JoinHostPort(h, "80")] = true
-		c.hosts[net.JoinHostPort(h, "443")] = true
+		for _, p := range ports {
+			c.hosts[net.JoinHostPort(host, p)] = true
+		}
 	}
 	c.timeout = opts.Timeout
 	c.http = &http.Client{
@@ -164,6 +168,31 @@ func (c *Client) EndRound() {
 			delete(c.validators, k)
 		}
 	}
+}
+
+const hostFormat = "should be a host like cdn.example.com or cdn.example.com:8443, without a scheme or path"
+
+// ParseHost reads an allowlist entry, "host" or "host:port", and returns the
+// lowercase host and the ports it allows. A bare host allows 80 and 443.
+func ParseHost(h string) (host string, ports []string, err error) {
+	h = strings.ToLower(strings.TrimSpace(h))
+	if strings.ContainsAny(h, "/@?# ") {
+		return "", nil, fmt.Errorf("%q %s", h, hostFormat)
+	}
+	host, port, splitErr := net.SplitHostPort(h)
+	if splitErr != nil {
+		host, port = strings.Trim(h, "[]"), ""
+	}
+	if host == "" || strings.ContainsAny(host, "/:@?#% ") && net.ParseIP(host) == nil {
+		return "", nil, fmt.Errorf("%q %s", h, hostFormat)
+	}
+	if splitErr != nil {
+		return host, []string{"80", "443"}, nil
+	}
+	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+		return "", nil, fmt.Errorf("%q has an invalid port", h)
+	}
+	return host, []string{port}, nil
 }
 
 // MayFetch reports whether u is on the allowlist and robots.txt for its host
@@ -231,7 +260,7 @@ func (c *Client) robotsFor(ctx context.Context, u *url.URL) robotsEntry {
 func (c *Client) fetchRobots(ctx context.Context, u *url.URL) (robotsEntry, error) {
 	ru := u.ResolveReference(&url.URL{Path: "/robots.txt"})
 	e := robotsEntry{data: disallowAll, unavailable: true}
-	resp, err := c.get(ctx, ru, "text/plain", false, false, c.maxBytes)
+	resp, err := c.get(ctx, ru, "text/plain", false, false, -maxRobotsBytes)
 	switch {
 	case errors.Is(err, ErrNotAllowed), errors.Is(err, errTooManyRedirects):
 		// robots.txt redirects to a host sshr won't contact, like a CDN,
@@ -345,7 +374,8 @@ const maxRedirects = 5
 var errTooManyRedirects = errors.New("fetch: too many redirects")
 
 // do sends one request. For a redirect it returns the next URL instead of
-// a response.
+// a response. A positive maxBytes makes a larger body an error, and a
+// negative one cuts the body to -maxBytes bytes.
 func (c *Client) do(ctx context.Context, u *url.URL, accept string, conditional bool, maxBytes int64) (*Response, *url.URL, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
@@ -401,12 +431,19 @@ func (c *Client) do(ctx context.Context, u *url.URL, accept string, conditional 
 	if mt, _, err := mime.ParseMediaType(res.Header.Get("Content-Type")); err == nil {
 		out.ContentType = strings.ToLower(mt)
 	}
-	body, err := io.ReadAll(io.LimitReader(res.Body, maxBytes+1))
+	limit := maxBytes
+	if limit < 0 {
+		limit = -limit
+	}
+	body, err := io.ReadAll(io.LimitReader(res.Body, limit+1))
 	if err != nil {
 		return nil, nil, err
 	}
-	if int64(len(body)) > maxBytes {
-		return nil, nil, fmt.Errorf("fetch: %q is larger than %d bytes", u, maxBytes)
+	if int64(len(body)) > limit {
+		if maxBytes > 0 {
+			return nil, nil, fmt.Errorf("fetch: %q is larger than %d bytes", u, limit)
+		}
+		body = body[:limit]
 	}
 	out.Body = body
 

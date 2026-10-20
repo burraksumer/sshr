@@ -3,6 +3,7 @@ package render
 import (
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/charmbracelet/x/ansi"
@@ -229,5 +230,35 @@ func TestLinksInStrikethroughNumbered(t *testing.T) {
 	}
 	if len(doc.Links) != 1 || !strings.Contains(ansi.Strip(doc.Content), "the old docs [1]") {
 		t.Errorf("links %+v, content:\n%s", doc.Links, ansi.Strip(doc.Content))
+	}
+}
+
+func TestSameDocumentAnchorsNotNumbered(t *testing.T) {
+	md := "See [the notes](https://site.example/post#notes) and [other](https://site.example/other#x)."
+	doc, err := Markdown(md, Options{Width: 80, BaseURL: "https://site.example/post"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Links) != 1 || doc.Links[0].URL != "https://site.example/other#x" {
+		t.Errorf("links = %+v", doc.Links)
+	}
+	if plain := ansi.Strip(doc.Content); !strings.Contains(plain, "the notes and") {
+		t.Errorf("anchor text missing or numbered:\n%s", plain)
+	}
+}
+
+func TestCachedRendersOnce(t *testing.T) {
+	id := new(int)
+	md := strings.Repeat("text ", 20000)
+	var wg sync.WaitGroup
+	docs := make([]Document, 8)
+	for i := range docs {
+		wg.Go(func() { docs[i], _ = Cached(id, md, Options{Width: 77}) })
+	}
+	wg.Wait()
+	for i := range docs {
+		if docs[i].Content != docs[0].Content || docs[i].Content == "" {
+			t.Fatal("sessions got different renders")
+		}
 	}
 }

@@ -106,6 +106,12 @@ func numberLinks(doc ast.Node, source []byte, base string) ([]byte, []Link) {
 			continue
 		}
 		dest = resolve(base, dest)
+		// A link to a section of this same document, which html-to-markdown
+		// makes absolute, isn't worth a number. Show its text only.
+		if sameDocument(dest, base) {
+			l.Destination = []byte("#")
+			continue
+		}
 		num, ok := byURL[dest]
 		if !ok {
 			num = len(links) + 1

@@ -31,6 +31,18 @@ func Clickable(u string) bool {
 	return false
 }
 
+// sameDocument reports whether u points into the document at base, differing
+// at most in the fragment.
+func sameDocument(u, base string) bool {
+	a, err1 := url.Parse(u)
+	b, err2 := url.Parse(base)
+	if err1 != nil || err2 != nil || a.Fragment == "" {
+		return false
+	}
+	a.Fragment, a.RawFragment, b.Fragment, b.RawFragment = "", "", "", ""
+	return a.String() == b.String()
+}
+
 // resolve returns ref resolved against base, with every byte that isn't
 // printable ASCII percent-encoded.
 func resolve(base, ref string) string {
