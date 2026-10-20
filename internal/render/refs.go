@@ -193,7 +193,7 @@ func filterOutput(s string, targets map[string]bool) string {
 			}
 		}
 		r, size := utf8.DecodeRuneInString(s[i:])
-		// Invalid bytes are dropped too; a lone 0x9b is an 8-bit CSI.
+		// Invalid bytes are dropped too. A lone 0x9b is an 8-bit CSI.
 		if !sanitize.Dropped(r) && (r != utf8.RuneError || size > 1) {
 			b.WriteString(s[i : i+size])
 		}

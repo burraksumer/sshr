@@ -15,6 +15,7 @@ import (
 	"github.com/burraksumer/sshr/internal/content"
 	"github.com/burraksumer/sshr/internal/render"
 	"github.com/charmbracelet/x/ansi"
+	"golang.org/x/time/rate"
 )
 
 // maxReadWidth keeps lines short enough to read comfortably on wide terminals.
@@ -48,8 +49,9 @@ type Model struct {
 
 	// reader
 	resizeGen int
-	resizing  bool    // a resize is waiting to settle
-	keepPos   float64 // reading position from before it started
+	renders   *rate.Limiter // re-renders after resizes
+	resizing  bool          // a resize is waiting to settle
+	keepPos   float64       // reading position from before it started
 	entry     *content.Entry
 	doc       render.Document
 	vp        viewport.Model
@@ -66,7 +68,7 @@ func New(store *content.Store) Model {
 	// ctrl+v reads the clipboard of the machine sshr runs on, which over SSH
 	// is the server. Terminal paste still works through bracketed paste.
 	ti.KeyMap.Paste.SetEnabled(false)
-	m := Model{store: store, dark: true, width: 80, height: 24, filter: ti}
+	m := Model{store: store, dark: true, width: 80, height: 24, filter: ti, renders: rate.NewLimiter(2, 3)}
 	m.st = newStyles(m.dark)
 	m.vp = viewport.New()
 	m.syncSite()
@@ -165,9 +167,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Tick(resizeSettle, func(time.Time) tea.Msg { return resizedMsg{gen} })
 
 	case resizedMsg:
-		if msg.gen == m.resizeGen && m.entry != nil {
-			m.renderEntry(false)
+		if msg.gen != m.resizeGen || m.entry == nil {
+			return m, nil
 		}
+		// A client changing its window size nonstop gets a few renders a
+		// second, not one per change.
+		if m.renders != nil && !m.renders.Allow() {
+			gen := m.resizeGen
+			return m, tea.Tick(resizeSettle, func(time.Time) tea.Msg { return resizedMsg{gen} })
+		}
+		m.renderEntry(false)
 		return m, nil
 
 	case tea.BackgroundColorMsg:
@@ -585,7 +594,7 @@ func (m Model) viewReader() string {
 		left = m.status
 	}
 	right := m.st.dim.Render(fmt.Sprintf("%3.0f%%", m.vp.ScrollPercent()*100))
-	// The percentage always fits; the hints give way on narrow terminals.
+	// The percentage always fits, and the hints give way on narrow terminals.
 	left = ansi.Truncate(left, max(m.width-ansi.StringWidth(right)-3, 0), "…")
 	gap := max(m.width-ansi.StringWidth(left)-ansi.StringWidth(right)-2, 1)
 	return m.vp.View() + "\n " + left + strings.Repeat(" ", gap) + right

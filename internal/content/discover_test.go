@@ -1047,3 +1047,41 @@ func TestRenderIDStableAcrossRefreshes(t *testing.T) {
 		t.Error("changed body kept its render ID")
 	}
 }
+
+// The homepage is fetched conditionally, and its feed links are reused on a
+// 304.
+func TestHomepageConditional(t *testing.T) {
+	var homeHits, home304 atomic.Int32
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("/{$}", func(w http.ResponseWriter, r *http.Request) {
+		homeHits.Add(1)
+		w.Header().Set("ETag", `"h"`)
+		if r.Header.Get("If-None-Match") == `"h"` {
+			home304.Add(1)
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<html><head><title>Home</title><link rel="alternate" type="application/rss+xml" href="/odd/path.rss"></head></html>`))
+	})
+	mux.HandleFunc("/odd/path.rss", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`<?xml version="1.0"?><rss version="2.0"><channel><item><title>P</title>
+<link>` + srv.URL + `/p</link><content:encoded xmlns:content="http://purl.org/rss/1.0/modules/content/">Body</content:encoded></item></channel></rss>`))
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+	base, _ := url.Parse(srv.URL + "/")
+	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Host}, Rate: 1000, Burst: 100}), Base: base}
+	site, err := d.Discover(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	site, err = d.Discover(context.Background(), site, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if home304.Load() != 1 || site.Title != "Home" || site.Lookup(srv.URL+"/p") == nil {
+		t.Errorf("304s %d, title %q, post found %v", home304.Load(), site.Title, site.Lookup(srv.URL+"/p") != nil)
+	}
+}

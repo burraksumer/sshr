@@ -142,6 +142,7 @@ func (s *Server) ListenAndServe(ctx context.Context, listening func()) error {
 	if s.cfg.ProxyProtocol {
 		policy, err := proxyproto.TrustProxyHeaderFromRanges(s.cfg.TrustedProxies)
 		if err != nil {
+			l.Close()
 			return fmt.Errorf("trusted_proxies: %w", err)
 		}
 		l = &proxyproto.Listener{Listener: l, ConnPolicy: policy, ReadHeaderTimeout: 5 * time.Second}

@@ -110,8 +110,7 @@ func (c *docCache) put(k cacheKey, doc Document, extra int) {
 }
 
 // Cached is Markdown with a cache shared by all callers. id names the
-// document, and must change whenever md does. A content entry pointer
-// works, since a refresh makes new entries.
+// document, and must change whenever md does.
 func Cached(id any, md string, opts Options) (doc Document, err error) {
 	k := cacheKey{id: id, base: opts.BaseURL, width: opts.Width, dark: opts.Dark}
 	cached, r, mine := shared.claim(k)
@@ -136,8 +135,7 @@ func Cached(id any, md string, opts Options) (doc Document, err error) {
 	}()
 	r.doc, r.err = renderMarkdown(md, opts)
 	if r.err == nil {
-		// The id keeps md alive while cached, so md counts too.
-		shared.put(k, r.doc, len(md))
+		shared.put(k, r.doc, 0)
 	}
 	return r.doc, r.err
 }

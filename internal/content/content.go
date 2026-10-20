@@ -60,6 +60,8 @@ type Site struct {
 	// because their page couldn't be fetched, so a refresh that gets 304
 	// for the feed can retry them.
 	feedEntries []*Entry
+	// home is what the homepage's head said, reused on a 304 or an outage.
+	home *headMeta
 	// robotsSitemaps is the sitemap list from robots.txt, reused when
 	// robots.txt can't be fetched.
 	robotsSitemaps []string

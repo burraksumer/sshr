@@ -27,6 +27,8 @@ type Config struct {
 	Refresh Duration `toml:"refresh"`
 	// MaxEntries caps how many posts and pages are kept.
 	MaxEntries int `toml:"max_entries"`
+	// PageBudget bounds how long one refresh spends fetching pages.
+	PageBudget Duration `toml:"page_budget"`
 
 	Listen         string   `toml:"listen"`
 	HostKey        string   `toml:"host_key"`
@@ -46,6 +48,7 @@ func Default() Config {
 	return Config{
 		Refresh:     Duration(15 * time.Minute),
 		MaxEntries:  content.DefaultMaxEntries,
+		PageBudget:  Duration(content.DefaultPageBudget),
 		Listen:      ":2222",
 		HostKey:     ".sshr/host_ed25519",
 		MaxSessions: 200,
@@ -103,6 +106,9 @@ func (c Config) Validate() error {
 	}
 	if c.Refresh.D() < MinRefresh {
 		return fmt.Errorf("refresh must be at least %s, got %s", MinRefresh, c.Refresh.D())
+	}
+	if c.PageBudget.D() < time.Minute {
+		return fmt.Errorf("page_budget must be at least 1m, got %s", c.PageBudget.D())
 	}
 	for name, d := range map[string]Duration{"idle_timeout": c.IdleTimeout, "max_session": c.MaxSession} {
 		if d < 0 {
@@ -167,7 +173,7 @@ func ParseSiteURL(raw string) (*url.URL, error) {
 // and "host:port" allows that port. A site URL with an explicit port allows
 // only that port.
 func (c Config) Hosts(site *url.URL) []string {
-	h := strings.ToLower(site.Hostname())
+	h := fetch.HostKey(site.Hostname())
 	withPort := func(host string) string {
 		if p := site.Port(); p != "" {
 			return net.JoinHostPort(host, p)

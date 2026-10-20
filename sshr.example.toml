@@ -12,6 +12,9 @@ url = "https://example.com"
 # to keep.
 # refresh = "15m"
 # max_entries = 200
+# How long one refresh may spend fetching pages. With a long Crawl-delay,
+# pages past it are fetched in later refreshes.
+# page_budget = "10m"
 
 # listen = ":2222"
 # host_key = ".sshr/host_ed25519"

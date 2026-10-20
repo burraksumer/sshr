@@ -205,20 +205,28 @@ func (c *Client) EndRound() {
 
 const hostFormat = "should be a host like cdn.example.com or cdn.example.com:8443, without a scheme or path"
 
-// hostKey is the form hosts are compared in: lowercase and, for Unicode
-// names, punycode, so bücher.de and xn--bcher-kva.de match.
-func hostKey(h string) string {
-	h = strings.ToLower(h)
-	if a, err := idna.Lookup.ToASCII(h); err == nil {
-		return a
+// HostKey is the form hosts are compared and dialed in: lowercase ASCII,
+// with Unicode names in punycode, so bücher.de and xn--bcher-kva.de match.
+// It converts the original string exactly as net/http does, because
+// lowercasing first changes some names, like İ to i. A Unicode name that
+// can't be converted gives "", which matches nothing.
+func HostKey(h string) string {
+	for i := 0; i < len(h); i++ {
+		if h[i] >= 0x80 {
+			a, err := idna.Lookup.ToASCII(h)
+			if err != nil {
+				return ""
+			}
+			return strings.ToLower(a)
+		}
 	}
-	return h
+	return strings.ToLower(h)
 }
 
 // ParseHost reads an allowlist entry, "host" or "host:port", and returns the
 // lowercase host and the ports it allows. A bare host allows 80 and 443.
 func ParseHost(h string) (host string, ports []string, err error) {
-	h = strings.ToLower(strings.TrimSpace(h))
+	h = strings.TrimSpace(h)
 	if strings.ContainsAny(h, "/@?# ") {
 		return "", nil, fmt.Errorf("%q %s", h, hostFormat)
 	}
@@ -229,7 +237,9 @@ func ParseHost(h string) (host string, ports []string, err error) {
 	if host == "" || strings.ContainsAny(host, "/:@?#% ") && net.ParseIP(host) == nil {
 		return "", nil, fmt.Errorf("%q %s", h, hostFormat)
 	}
-	host = hostKey(host)
+	if host = HostKey(host); host == "" {
+		return "", nil, fmt.Errorf("%q is not a valid host name", h)
+	}
 	if splitErr != nil {
 		return host, []string{"80", "443"}, nil
 	}
@@ -240,7 +250,7 @@ func ParseHost(h string) (host string, ports []string, err error) {
 }
 
 // MayFetch reports whether u is on the allowlist and robots.txt for its host
-// doesn't refuse it. While robots.txt is unavailable it says yes; the fetch
+// doesn't refuse it. While robots.txt is unavailable it says yes, and the fetch
 // itself then fails with ErrRobotsUnavailable, and callers can fall back to
 // a copy from an earlier refresh.
 func (c *Client) MayFetch(ctx context.Context, u *url.URL) bool {
@@ -259,7 +269,7 @@ func (c *Client) checkURL(u *url.URL) error {
 	if port == "" {
 		port = map[string]string{"http": "80", "https": "443"}[u.Scheme]
 	}
-	if !c.hosts[net.JoinHostPort(hostKey(u.Hostname()), port)] {
+	if !c.hosts[net.JoinHostPort(HostKey(u.Hostname()), port)] {
 		return fmt.Errorf("%w: %q", ErrNotAllowed, u.Host)
 	}
 	return nil
@@ -270,6 +280,19 @@ func robotsError(u *url.URL, unavailable bool) error {
 		return fmt.Errorf("%w: %w: %q", ErrDisallowed, ErrRobotsUnavailable, u)
 	}
 	return fmt.Errorf("%w: %q", ErrDisallowed, u)
+}
+
+// asciiHost returns u with its host in HostKey form.
+func asciiHost(u *url.URL) *url.URL {
+	c := *u
+	if p := u.Port(); p != "" {
+		c.Host = net.JoinHostPort(HostKey(u.Hostname()), p)
+	} else if h := HostKey(u.Hostname()); strings.Contains(h, ":") {
+		c.Host = "[" + h + "]"
+	} else {
+		c.Host = h
+	}
+	return &c
 }
 
 // origin identifies whose robots.txt applies to u.
@@ -402,11 +425,16 @@ func (c *Client) get(ctx context.Context, u *url.URL, accept string, conditional
 		c.mu.Unlock()
 		if to, err := url.Parse(m.to); ok && err == nil {
 			res, err := c.follow(ctx, to, start, accept, conditional, checkRobots, maxBytes)
-			// The new place is gone. The old URL may work again.
+			// Keep the mapping only while the new place answers directly.
+			// If it redirects elsewhere or is gone, forget it, and when it
+			// is gone, the old URL may work again.
+			if err == nil && (res.NotModified || res.Status == http.StatusOK) && res.URL.String() == asciiHost(to).String() {
+				return res, nil
+			}
+			c.mu.Lock()
+			delete(c.moved, start)
+			c.mu.Unlock()
 			if err == nil && (res.Status == http.StatusNotFound || res.Status == http.StatusGone) {
-				c.mu.Lock()
-				delete(c.moved, start)
-				c.mu.Unlock()
 				return c.follow(ctx, u, start, accept, conditional, checkRobots, maxBytes)
 			}
 			return res, err
@@ -429,6 +457,9 @@ func (c *Client) follow(ctx context.Context, u *url.URL, start, accept string, c
 		if err := c.checkURL(u); err != nil {
 			return nil, err
 		}
+		// Request the host in the exact form that was checked, so the name
+		// net/http dials is the allowlisted one by construction.
+		u = asciiHost(u)
 		if checkRobots {
 			if allowed, unavailable := c.robotsAllow(ctx, u); !allowed {
 				return nil, robotsError(u, unavailable)

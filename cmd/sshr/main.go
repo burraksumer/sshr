@@ -173,7 +173,7 @@ func newStore(cfg config.Config, log *slog.Logger) (*content.Store, error) {
 		return nil, err
 	}
 	client := fetch.New(fetch.Options{Hosts: cfg.Hosts(base)})
-	disc := &content.Discoverer{Client: client, Base: base, MaxEntries: cfg.MaxEntries, Log: log}
+	disc := &content.Discoverer{Client: client, Base: base, MaxEntries: cfg.MaxEntries, PageBudget: cfg.PageBudget.D(), Log: log}
 	return content.NewStore(disc, log), nil
 }
 

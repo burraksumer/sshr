@@ -392,3 +392,21 @@ func TestMovedTargetGone(t *testing.T) {
 		t.Errorf("got %q, %v", res.Body, err)
 	}
 }
+
+// U+0130 lowercases to a plain i in Go, but IDNA maps it to i plus a
+// combining dot, which is a different domain. Such hosts must not pass as
+// the ASCII one, and a redirect to one must not reach another server.
+func TestDottedCapitalINotAllowed(t *testing.T) {
+	c := New(Options{Hosts: []string{"i.com", "mysite.example"}})
+	for _, raw := range []string{"http://İ.com/", "http://mySİte.example/secret"} {
+		if err := c.checkURL(mustURL(t, raw)); err == nil {
+			t.Errorf("%s passed the allowlist", raw)
+		}
+	}
+	if HostKey("İ.com") == "i.com" {
+		t.Error("HostKey folds İ to i")
+	}
+	if got := asciiHost(mustURL(t, "https://bücher.de:8443/x")).Host; got != "xn--bcher-kva.de:8443" {
+		t.Errorf("asciiHost = %q", got)
+	}
+}

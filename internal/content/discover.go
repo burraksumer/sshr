@@ -111,7 +111,7 @@ type Discoverer struct {
 }
 
 // Discover fetches the site and returns a new snapshot. prev is the last
-// snapshot, used for conditional requests; it may be nil. When prev is nil
+// snapshot, used for conditional requests, and may be nil. When prev is nil
 // and publish is set, Discover calls publish with a partial snapshot as soon
 // as the entries that came with full content are ready, before fetching
 // individual pages.
@@ -139,26 +139,38 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 
 	site := &Site{URL: d.Base.String(), Title: d.Base.Hostname(), robotsSitemaps: sitemaps}
 	var feedLinks []feedLink
-	if res, err := d.Client.Get(ctx, d.Base, acceptHTML, false); err != nil || res.Status != 200 {
+	// The homepage is asked for conditionally, and its head is reused when
+	// it hasn't changed.
+	var meta *headMeta
+	res, err := d.Client.Get(ctx, d.Base, acceptHTML, prev != nil && prev.home != nil)
+	switch {
+	case err == nil && res.NotModified && prev != nil:
+		meta = prev.home
+	case err == nil && res.Status == 200:
+		m := parseHead(res.Body)
+		for i, f := range m.feeds {
+			if u, err := res.URL.Parse(f.href); err == nil {
+				m.feeds[i].href = sanitize.URL(u.String())
+			}
+		}
+		meta = &m
+	default:
 		if err != nil {
 			log.Warn("homepage", "err", err)
 		}
-		// Keep last round's title and description rather than showing the
-		// bare host name while the homepage is down.
+		// Keep last round's head rather than showing the bare host name
+		// while the homepage is down.
 		if prev != nil {
-			site.Title, site.Description = prev.Title, prev.Description
+			meta = prev.home
 		}
-	} else {
-		meta := parseHead(res.Body)
+	}
+	site.home = meta
+	if meta != nil {
 		if meta.title != "" {
 			site.Title = meta.title
 		}
 		site.Description = meta.description
-		for _, f := range meta.feeds {
-			if u, err := res.URL.Parse(f.href); err == nil {
-				feedLinks = append(feedLinks, feedLink{href: sanitize.URL(u.String()), typ: f.typ})
-			}
-		}
+		feedLinks = meta.feeds
 	}
 
 	// Feeds give posts with dates and, often, full content.
@@ -198,6 +210,8 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 
 	// The sitemap adds pages the feed doesn't list.
 	seen := map[string]bool{normalize(d.Base): true}
+	// When the site URL names a file, its directory is the same listing.
+	seen[normalize(d.Base.ResolveReference(&url.URL{Path: scope}))] = true
 	if feedURL != "" {
 		if u, err := url.Parse(feedURL); err == nil {
 			seen[normalize(u)] = true
@@ -365,8 +379,13 @@ func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []feedLink,
 				}
 			}
 			// A site-wide feed found from a /blog site only counts for
-			// its /blog posts.
-			if u, err := url.Parse(e.URL); e.URL != "" && (err != nil || !inScope(u, scope)) {
+			// its /blog posts. Items without a URL can't be placed, so a
+			// scoped site leaves them out.
+			if e.URL == "" {
+				if scope != "/" {
+					continue
+				}
+			} else if u, err := url.Parse(e.URL); err != nil || !inScope(u, scope) {
 				continue
 			}
 			entries = append(entries, e)

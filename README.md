@@ -62,7 +62,7 @@ If the machine already runs OpenSSH on port 22 for your own logins, move one of 
 
 Everything except the URL has a default. See [`sshr.example.toml`](sshr.example.toml) for every option.
 
-sshr reads `sshr.toml` from the working directory if it exists. A file named with `--config` or `SSHR_CONFIG` must exist. In Docker the working directory is `/data`, so mount the file at `/data/sshr.toml`. `SSHR_URL`, `SSHR_LISTEN`, `SSHR_HOST_KEY` and `SSHR_LOG_FORMAT` override the file, and `--url` and `--listen` override both. Set `SSHR_DEBUG=1` to log every fetch.
+sshr reads `sshr.toml` from the working directory if it exists. A file named with `--config` or `SSHR_CONFIG` must exist. In Docker the working directory is `/data`, so mount the file at `/data/sshr.toml`. `SSHR_URL`, `SSHR_LISTEN`, `SSHR_HOST_KEY` and `SSHR_LOG_FORMAT` override the file, and `--url` and `--listen` override both. Set `SSHR_DEBUG=1` to also log fetches that fail.
 
 ## Keys
 
