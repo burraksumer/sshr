@@ -48,6 +48,8 @@ type Model struct {
 
 	// reader
 	resizeGen int
+	resizing  bool    // a resize is waiting to settle
+	keepPos   float64 // reading position from before it started
 	entry     *content.Entry
 	doc       render.Document
 	vp        viewport.Model
@@ -151,7 +153,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		// Dragging a window edge sends many sizes. Resize the viewport now
-		// and render the text once the size settles.
+		// and render the text once the size settles, at the position the
+		// reader was at before the first of them.
+		if !m.resizing {
+			m.keepPos, m.resizing = readingPosition(m.vp), true
+		}
 		m.vp.SetWidth(m.width)
 		m.vp.SetHeight(max(m.height-1, 1))
 		m.resizeGen++
@@ -388,7 +394,7 @@ func (m *Model) renderEntry(top bool) {
 	m.vp.SetWidth(m.width)
 	m.vp.SetHeight(max(m.height-1, 1))
 
-	doc, err := render.Cached(m.entry.Body, render.Options{Width: w, Dark: m.dark, BaseURL: m.entry.URL})
+	doc, err := render.Cached(m.entry, m.entry.Body, render.Options{Width: w, Dark: m.dark, BaseURL: m.entry.URL})
 	if err != nil {
 		// The body is sanitized markdown, but render failed, so show it
 		// unstyled rather than nothing.
@@ -407,13 +413,27 @@ func (m *Model) renderEntry(top bool) {
 
 	// Rewrapping changes the line count, so keep the reading position as a
 	// fraction of the document rather than a line number.
-	pct := m.vp.ScrollPercent()
+	pos := readingPosition(m.vp)
+	if m.resizing {
+		pos, m.resizing = m.keepPos, false
+	}
 	m.vp.SetContent(b.String())
 	if top {
 		m.vp.GotoTop()
 	} else {
-		m.vp.SetYOffset(int(pct * float64(max(m.vp.TotalLineCount()-m.vp.Height(), 0))))
+		m.vp.SetYOffset(int(pos * float64(max(m.vp.TotalLineCount()-m.vp.Height(), 0))))
 	}
+}
+
+// readingPosition is how far down the document the viewport is, from 0 at
+// the top to 1 at the bottom. Unlike ScrollPercent it is 0, not 1, when the
+// whole document fits.
+func readingPosition(vp viewport.Model) float64 {
+	scrollable := vp.TotalLineCount() - vp.Height()
+	if scrollable <= 0 {
+		return 0
+	}
+	return float64(vp.YOffset()) / float64(scrollable)
 }
 
 func entryMeta(e *content.Entry) string {

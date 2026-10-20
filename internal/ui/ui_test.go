@@ -1,7 +1,10 @@
 package ui
 
 import (
+	"strings"
 	"testing"
+
+	"charm.land/bubbles/v2/viewport"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/burraksumer/sshr/internal/content"
@@ -63,5 +66,21 @@ func TestOpenClearsSearchFocus(t *testing.T) {
 	m.open(&content.Entry{Body: "x"}, false)
 	if m.filtering {
 		t.Error("search still focused after opening an entry")
+	}
+}
+
+// A post that fits on screen, read from the top, stays at the top after a
+// resize makes it longer than the screen.
+func TestResizeKeepsTopOfShortPost(t *testing.T) {
+	body := strings.Repeat("word ", 120)
+	m := Model{st: newStyles(true), width: 120, height: 40}
+	m.vp = viewport.New()
+	m.open(&content.Entry{Body: body}, false)
+	var tm tea.Model = m
+	tm, cmd := tm.(Model).Update(tea.WindowSizeMsg{Width: 30, Height: 8})
+	tm, _ = tm.(Model).Update(cmd())
+	got := tm.(Model)
+	if off := got.vp.YOffset(); off != 0 {
+		t.Errorf("offset after resize = %d, want 0", off)
 	}
 }

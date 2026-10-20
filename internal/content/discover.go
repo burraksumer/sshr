@@ -55,6 +55,11 @@ func capBody(s string) string {
 	return strings.ToValidUTF8(cut, "") + "\n\n*This entry was cut short because it is very long.*\n"
 }
 
+// DefaultPageBudget is how long a refresh spends fetching pages unless
+// configured otherwise. With a long Crawl-delay, the rest come in later
+// refreshes.
+const DefaultPageBudget = 10 * time.Minute
+
 // DefaultMaxEntries is how many posts and pages a site keeps unless
 // configured otherwise.
 const DefaultMaxEntries = 200
@@ -91,6 +96,8 @@ func inScope(u *url.URL, scope string) bool {
 type Discoverer struct {
 	Client *fetch.Client
 	Base   *url.URL
+	// PageBudget bounds how long one refresh spends fetching pages.
+	PageBudget time.Duration
 	// MaxEntries caps how many documents a site may have.
 	MaxEntries int
 	Log        *slog.Logger
@@ -434,6 +441,11 @@ func entryFromItem(item *gofeed.Item, feedURL *url.URL) *Entry {
 // fillBodies fetches the page for every entry that has no body yet.
 func (d *Discoverer) fillBodies(ctx context.Context, entries []*Entry, prev *Site, log *slog.Logger) {
 	const workers = 4
+	budget := d.PageBudget
+	if budget <= 0 {
+		budget = DefaultPageBudget
+	}
+	deadline := time.Now().Add(budget)
 	jobs := make(chan *Entry)
 	var wg sync.WaitGroup
 	for range workers {
@@ -449,16 +461,32 @@ func (d *Discoverer) fillBodies(ctx context.Context, entries []*Entry, prev *Sit
 			}
 		})
 	}
+	skipped := 0
 	for _, e := range entries {
-		if e.Body == "" && e.URL != "" {
-			select {
-			case jobs <- e:
-			case <-ctx.Done():
+		if e.Body != "" || e.URL == "" {
+			continue
+		}
+		// Past the budget, entries keep last refresh's copy, if there is
+		// one, and get fetched in a later refresh.
+		if time.Now().After(deadline) {
+			skipped++
+			if prev != nil {
+				if old := prev.Lookup(e.URL); old != nil && old.Body != "" {
+					reuse(e, old)
+				}
 			}
+			continue
+		}
+		select {
+		case jobs <- e:
+		case <-ctx.Done():
 		}
 	}
 	close(jobs)
 	wg.Wait()
+	if skipped > 0 {
+		log.Info("page budget used up, the rest wait for the next refresh", "skipped", skipped)
+	}
 }
 
 func (d *Discoverer) fillBody(ctx context.Context, e *Entry, old *Entry) error {
@@ -550,7 +578,11 @@ func (d *Discoverer) readPage(e *Entry, res *fetch.Response) error {
 
 // reuse copies old's page content into e, keeping the feed's own fields.
 func reuse(e, old *Entry) {
-	e.Body, e.Kind, e.pageBody = old.Body, old.Kind, true
+	e.Body, e.pageBody = old.Body, true
+	// Feed entries are posts whatever the page looked like last time.
+	if !e.fromFeed {
+		e.Kind = old.Kind
+	}
 	if e.Title == "" {
 		e.Title = old.Title
 	}

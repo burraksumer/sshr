@@ -179,3 +179,33 @@ func TestRobotsRedirectOffAllowlist(t *testing.T) {
 		t.Errorf("err = %v, want the page to be allowed", err)
 	}
 }
+
+// A redirect hop waits on the rate limiter outside the request timeout, so a
+// slow rate, as with a Crawl-delay, doesn't make redirected fetches fail.
+func TestRedirectWaitNotInTimeout(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/a", func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, "/b", http.StatusMovedPermanently) })
+	mux.HandleFunc("/b", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	// One request per 400ms, and each request may take 200ms.
+	c := New(Options{Hosts: []string{mustURL(t, srv.URL).Host}, Rate: 2.5, Burst: 1, Timeout: 200 * time.Millisecond})
+	res, err := c.Get(context.Background(), mustURL(t, srv.URL+"/a"), "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(res.Body) != "ok" || res.URL.Path != "/b" {
+		t.Errorf("got %q from %s", res.Body, res.URL)
+	}
+}
+
+func TestRobotsRedirectLoopAllows(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, "/robots.txt", http.StatusFound) })
+	mux.HandleFunc("/page", func(w http.ResponseWriter, r *http.Request) {})
+	srv, c := testServer(t, mux.ServeHTTP)
+	c.LoadRobots(context.Background(), mustURL(t, srv.URL))
+	if _, err := c.Get(context.Background(), mustURL(t, srv.URL+"/page"), "", false); err != nil {
+		t.Errorf("err = %v, want the page allowed after a robots.txt redirect loop", err)
+	}
+}

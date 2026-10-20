@@ -9,9 +9,10 @@ import (
 const cacheBytes = 32 << 20
 
 type cacheKey struct {
-	md, base string
-	width    int
-	dark     bool
+	id    any
+	base  string
+	width int
+	dark  bool
 }
 
 type cacheEntry struct {
@@ -48,12 +49,12 @@ func (c *docCache) get(k cacheKey) (Document, bool) {
 	return el.Value.(*cacheEntry).doc, true
 }
 
-func (c *docCache) put(k cacheKey, doc Document) {
-	// The key holds the markdown, which keeps it alive, so it counts too.
-	size := len(k.md) + len(doc.Content)
+func (c *docCache) put(k cacheKey, doc Document, extra int) {
+	size := len(doc.Content)
 	for _, l := range doc.Links {
 		size += len(l.URL) + len(l.Text)
 	}
+	size += extra
 	if size > c.max/4 {
 		return // too big to be worth holding
 	}
@@ -73,15 +74,18 @@ func (c *docCache) put(k cacheKey, doc Document) {
 	}
 }
 
-// Cached is Markdown with a cache shared by all callers.
-func Cached(md string, opts Options) (Document, error) {
-	k := cacheKey{md: md, base: opts.BaseURL, width: opts.Width, dark: opts.Dark}
+// Cached is Markdown with a cache shared by all callers. id names the
+// document, and must change whenever md does. A content entry pointer
+// works, since a refresh makes new entries.
+func Cached(id any, md string, opts Options) (Document, error) {
+	k := cacheKey{id: id, base: opts.BaseURL, width: opts.Width, dark: opts.Dark}
 	if doc, ok := shared.get(k); ok {
 		return doc, nil
 	}
 	doc, err := Markdown(md, opts)
 	if err == nil {
-		shared.put(k, doc)
+		// The id keeps md alive while cached, so md counts too.
+		shared.put(k, doc, len(md))
 	}
 	return doc, err
 }

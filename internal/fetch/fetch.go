@@ -20,6 +20,10 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// MaxCrawlDelay caps the Crawl-delay sshr honors. Longer delays would make a
+// refresh of a few hundred pages take hours.
+const MaxCrawlDelay = 30 * time.Second
+
 // UserAgent identifies sshr to the sites it reads. Site owners can match
 // "sshr" in robots.txt.
 const UserAgent = "sshr/0.1 (+https://sshr.dev)"
@@ -71,6 +75,7 @@ type validators struct {
 // Client fetches documents from a fixed set of hosts.
 type Client struct {
 	http     *http.Client
+	timeout  time.Duration   // per request, not counting rate limiter waits
 	hosts    map[string]bool // "host:port"
 	limiter  *rate.Limiter
 	rate     rate.Limit
@@ -99,10 +104,6 @@ type robotsEntry struct {
 // unreachable robots.txt as a full disallow, like a 5xx. The rule lives on
 // RobotsData, not on its groups, so callers must use TestAgent.
 var disallowAll, _ = robotstxt.FromStatusAndBytes(http.StatusServiceUnavailable, nil)
-
-// skipRobots marks requests, and so their redirects, that ignore robots.txt.
-// Only the robots.txt fetch itself uses it.
-type skipRobots struct{}
 
 // New returns a Client limited to opts.Hosts.
 func New(opts Options) *Client {
@@ -137,26 +138,10 @@ func New(opts Options) *Client {
 		c.hosts[net.JoinHostPort(h, "80")] = true
 		c.hosts[net.JoinHostPort(h, "443")] = true
 	}
+	c.timeout = opts.Timeout
 	c.http = &http.Client{
-		Timeout: opts.Timeout,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 5 {
-				return errors.New("fetch: too many redirects")
-			}
-			if err := c.checkURL(req.URL); err != nil {
-				return err
-			}
-			// Each hop is a request to the site, so it waits its turn.
-			if err := c.limiter.Wait(req.Context()); err != nil {
-				return err
-			}
-			if req.Context().Value(skipRobots{}) == nil {
-				if allowed, unavailable := c.robotsAllow(req.Context(), req.URL); !allowed {
-					return robotsError(req.URL, unavailable)
-				}
-			}
-			return nil
-		},
+		// get follows redirects itself.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 	return c
 }
@@ -181,25 +166,16 @@ func (c *Client) EndRound() {
 	}
 }
 
-// MayFetch is like Allowed but also says yes while robots.txt is unavailable.
-// The fetch itself then fails with ErrRobotsUnavailable, and callers can fall
-// back to a copy from an earlier refresh.
+// MayFetch reports whether u is on the allowlist and robots.txt for its host
+// doesn't refuse it. While robots.txt is unavailable it says yes; the fetch
+// itself then fails with ErrRobotsUnavailable, and callers can fall back to
+// a copy from an earlier refresh.
 func (c *Client) MayFetch(ctx context.Context, u *url.URL) bool {
 	if c.checkURL(u) != nil {
 		return false
 	}
 	allowed, unavailable := c.robotsAllow(ctx, u)
 	return allowed || unavailable
-}
-
-// Allowed reports whether u is on the allowlist and not blocked by its host's
-// robots.txt, which it fetches if needed.
-func (c *Client) Allowed(ctx context.Context, u *url.URL) bool {
-	if c.checkURL(u) != nil {
-		return false
-	}
-	allowed, _ := c.robotsAllow(ctx, u)
-	return allowed
 }
 
 func (c *Client) checkURL(u *url.URL) error {
@@ -255,12 +231,13 @@ func (c *Client) robotsFor(ctx context.Context, u *url.URL) robotsEntry {
 func (c *Client) fetchRobots(ctx context.Context, u *url.URL) (robotsEntry, error) {
 	ru := u.ResolveReference(&url.URL{Path: "/robots.txt"})
 	e := robotsEntry{data: disallowAll, unavailable: true}
-	resp, err := c.get(context.WithValue(ctx, skipRobots{}, true), ru, "text/plain", false, false, c.maxBytes)
+	resp, err := c.get(ctx, ru, "text/plain", false, false, c.maxBytes)
 	switch {
-	case errors.Is(err, ErrNotAllowed):
-		// robots.txt redirects to a host sshr won't contact, like a CDN.
-		// RFC 9309 treats a robots.txt that can't be followed as missing,
-		// which allows everything. Only network errors and 5xx disallow.
+	case errors.Is(err, ErrNotAllowed), errors.Is(err, errTooManyRedirects):
+		// robots.txt redirects to a host sshr won't contact, like a CDN,
+		// or redirects too many times. RFC 9309 treats a robots.txt that
+		// can't be followed as missing, which allows everything. Only
+		// network errors and 5xx disallow.
 		e.data, _ = robotstxt.FromStatusAndBytes(http.StatusNotFound, nil)
 		e.unavailable, err = false, nil
 	case err == nil:
@@ -312,7 +289,7 @@ func (c *Client) LoadRobots(ctx context.Context, base *url.URL) ([]string, error
 	}
 	data := e.data
 	if g := data.FindGroup(robotsAgent); g != nil && g.CrawlDelay > 0 {
-		c.limiter.SetLimit(min(rate.Every(g.CrawlDelay), c.rate))
+		c.limiter.SetLimit(min(rate.Every(min(g.CrawlDelay, MaxCrawlDelay)), c.rate))
 		c.limiter.SetBurst(1)
 	} else {
 		c.limiter.SetLimit(c.rate)
@@ -334,21 +311,47 @@ func (c *Client) GetLarge(ctx context.Context, u *url.URL, accept string, condit
 }
 
 func (c *Client) get(ctx context.Context, u *url.URL, accept string, conditional, checkRobots bool, maxBytes int64) (*Response, error) {
-	if err := c.checkURL(u); err != nil {
-		return nil, err
-	}
-	if checkRobots {
-		if allowed, unavailable := c.robotsAllow(ctx, u); !allowed {
-			return nil, robotsError(u, unavailable)
+	// Redirects are followed here rather than by net/http, so every hop gets
+	// the allowlist and robots.txt checks, waits on the rate limiter, and has
+	// its own timeout that doesn't include that wait.
+	for hop := 0; ; hop++ {
+		if hop > maxRedirects {
+			return nil, errTooManyRedirects
 		}
+		if err := c.checkURL(u); err != nil {
+			return nil, err
+		}
+		if checkRobots {
+			if allowed, unavailable := c.robotsAllow(ctx, u); !allowed {
+				return nil, robotsError(u, unavailable)
+			}
+		}
+		if err := c.limiter.Wait(ctx); err != nil {
+			return nil, err
+		}
+		res, next, err := c.do(ctx, u, accept, conditional, maxBytes)
+		if err != nil {
+			return nil, err
+		}
+		if next == nil {
+			return res, nil
+		}
+		u = next
 	}
-	if err := c.limiter.Wait(ctx); err != nil {
-		return nil, err
-	}
+}
 
+const maxRedirects = 5
+
+var errTooManyRedirects = errors.New("fetch: too many redirects")
+
+// do sends one request. For a redirect it returns the next URL instead of
+// a response.
+func (c *Client) do(ctx context.Context, u *url.URL, accept string, conditional bool, maxBytes int64) (*Response, *url.URL, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	req.Header.Set("User-Agent", UserAgent)
 	if accept != "" {
@@ -374,29 +377,36 @@ func (c *Client) get(ctx context.Context, u *url.URL, accept string, conditional
 
 	res, err := c.http.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer res.Body.Close()
 
-	out := &Response{URL: res.Request.URL, Status: res.StatusCode}
-	if res.StatusCode == http.StatusNotModified {
+	switch res.StatusCode {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		next, err := u.Parse(res.Header.Get("Location"))
+		if err != nil || res.Header.Get("Location") == "" {
+			return nil, nil, fmt.Errorf("fetch: %q redirects to an invalid location", u)
+		}
+		return nil, next, nil
+	case http.StatusNotModified:
 		// Only trust a 304 that answers validators we sent. Callers keep
 		// their previous result, which doesn't exist otherwise.
 		if !sent {
-			return nil, fmt.Errorf("fetch: %s answered 304 to an unconditional request", u)
+			return nil, nil, fmt.Errorf("fetch: %q answered 304 to an unconditional request", u)
 		}
-		out.NotModified = true
-		return out, nil
+		return &Response{URL: u, Status: res.StatusCode, NotModified: true}, nil, nil
 	}
+
+	out := &Response{URL: u, Status: res.StatusCode}
 	if mt, _, err := mime.ParseMediaType(res.Header.Get("Content-Type")); err == nil {
 		out.ContentType = strings.ToLower(mt)
 	}
 	body, err := io.ReadAll(io.LimitReader(res.Body, maxBytes+1))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if int64(len(body)) > maxBytes {
-		return nil, fmt.Errorf("fetch: %s is larger than %d bytes", u, maxBytes)
+		return nil, nil, fmt.Errorf("fetch: %q is larger than %d bytes", u, maxBytes)
 	}
 	out.Body = body
 
@@ -411,5 +421,5 @@ func (c *Client) get(ctx context.Context, u *url.URL, accept string, conditional
 		}
 		c.mu.Unlock()
 	}
-	return out, nil
+	return out, nil, nil
 }
