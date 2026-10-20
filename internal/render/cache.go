@@ -84,12 +84,11 @@ func (c *docCache) claim(k cacheKey) (doc Document, r *render, mine bool) {
 	return Document{}, r, true
 }
 
-func (c *docCache) put(k cacheKey, doc Document, extra int) {
+func (c *docCache) put(k cacheKey, doc Document) {
 	size := len(doc.Content)
 	for _, l := range doc.Links {
 		size += len(l.URL)
 	}
-	size += extra
 	if size > c.max/2 {
 		return // too big to hold without pushing out everything else
 	}
@@ -141,7 +140,7 @@ func Cached(id any, md string, opts Options) (doc Document, err error) {
 	}()
 	r.doc, r.err = renderMarkdown(md, opts)
 	if r.err == nil {
-		shared.put(k, r.doc, 0)
+		shared.put(k, r.doc)
 	}
 	return r.doc, r.err
 }

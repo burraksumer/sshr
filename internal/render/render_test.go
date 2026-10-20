@@ -206,19 +206,19 @@ func TestAllowedOSCRejectsNonASCII(t *testing.T) {
 func TestDocCacheEvicts(t *testing.T) {
 	c := newDocCache(90)
 	doc := func(n int) Document { return Document{Content: strings.Repeat("x", n)} }
-	c.put(cacheKey{id: "a"}, doc(20), 0)
-	c.put(cacheKey{id: "b"}, doc(20), 0)
+	c.put(cacheKey{id: "a"}, doc(20))
+	c.put(cacheKey{id: "b"}, doc(20))
 	c.get(cacheKey{id: "a"}) // a is now most recent
-	c.put(cacheKey{id: "c"}, doc(20), 0)
-	c.put(cacheKey{id: "d"}, doc(20), 0)
-	c.put(cacheKey{id: "e"}, doc(20), 0) // over 90 bytes, b goes first
+	c.put(cacheKey{id: "c"}, doc(20))
+	c.put(cacheKey{id: "d"}, doc(20))
+	c.put(cacheKey{id: "e"}, doc(20)) // over 90 bytes, b goes first
 	if _, ok := c.get(cacheKey{id: "b"}); ok {
 		t.Error("least recently used entry kept")
 	}
 	if _, ok := c.get(cacheKey{id: "a"}); !ok {
 		t.Error("recently used entry evicted")
 	}
-	c.put(cacheKey{id: "huge"}, doc(50), 0)
+	c.put(cacheKey{id: "huge"}, doc(50))
 	if _, ok := c.get(cacheKey{id: "huge"}); ok {
 		t.Error("entry over half the cache was stored")
 	}

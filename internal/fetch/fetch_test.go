@@ -465,3 +465,10 @@ func TestXHTMLWithDeclarationConverted(t *testing.T) {
 		t.Errorf("XHTML not converted: %q", got)
 	}
 }
+
+func TestXHTMLEncodingFromDeclaration(t *testing.T) {
+	body := append([]byte(`<?xml version="1.0" encoding="ISO-8859-9"?><html><body><p>`), 0xFE, 0xF0, '<', '/', 'p', '>')
+	if got := toUTF8(body, "application/xhtml+xml", "application/xhtml+xml"); !strings.Contains(string(got), "şğ") {
+		t.Errorf("declared encoding ignored: %q", got)
+	}
+}

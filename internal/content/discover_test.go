@@ -776,7 +776,8 @@ func TestDuplicateFeedItems(t *testing.T) {
 		host := strings.TrimPrefix(srv.URL, "http://")
 		w.Write([]byte(`{"version":"https://jsonfeed.org/version/1.1","items":[
 {"id":"1","url":"` + srv.URL + `/p/","title":"P","content_text":"a"},
-{"id":"2","url":"http://` + host + `/p","title":"P again","content_text":"b"}]}`))
+{"id":"1","url":"http://` + host + `/p","title":"P again","content_text":"b"},
+{"url":"http://` + host + `/p","title":"P a third time","content_text":"c"}]}`))
 	})
 	srv = httptest.NewServer(mux)
 	defer srv.Close()
@@ -1302,7 +1303,7 @@ func TestRedirectToHomepageDropped(t *testing.T) {
 	})
 	mux.HandleFunc("/feed.json", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/feed+json")
-		w.Write([]byte(`{"version":"https://jsonfeed.org/version/1.1","items":[{"id":"h","url":"` + srv.URL + `/","title":"Home item","content_text":"x"},{"id":"p","url":"` + srv.URL + `/p","title":"P","content_text":"p"}]}`))
+		w.Write([]byte(`{"version":"https://jsonfeed.org/version/1.1","items":[{"id":"h","url":"` + srv.URL + `/","title":"Home item","summary":"x"},{"id":"p","url":"` + srv.URL + `/p","title":"P","content_text":"p"}]}`))
 	})
 	mux.HandleFunc("/sitemap.xml", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`<?xml version="1.0"?><urlset><url><loc>/old-post</loc></url></urlset>`))
@@ -1323,5 +1324,29 @@ func TestRedirectToHomepageDropped(t *testing.T) {
 		if e.Title == "Home item" {
 			t.Error("feed item linking to the homepage kept")
 		}
+	}
+}
+
+// Items with their own IDs that share one link, as changelogs do, are all
+// kept, the later ones as text-only entries.
+func TestItemsSharingALink(t *testing.T) {
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("/feed.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/feed+json")
+		w.Write([]byte(`{"version":"https://jsonfeed.org/version/1.1","items":[
+{"id":"a","url":"` + srv.URL + `/","title":"Release 2","content_text":"two"},
+{"id":"b","url":"` + srv.URL + `/","title":"Release 1","content_text":"one"}]}`))
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+	base, _ := url.Parse(srv.URL + "/")
+	d := &Discoverer{Client: fetch.New(fetch.Options{Hosts: []string{base.Host}, Rate: 1000, Burst: 100}), Base: base}
+	site, err := d.Discover(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(site.Entries) != 2 {
+		t.Errorf("got %d entries, want both releases", len(site.Entries))
 	}
 }

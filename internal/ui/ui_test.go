@@ -129,3 +129,17 @@ func TestLargeBodyRendersInBackground(t *testing.T) {
 		t.Error("render never shown")
 	}
 }
+
+// A resize while a large post renders keeps the position the render will
+// open at.
+func TestResizeDuringPendingRenderKeepsPosition(t *testing.T) {
+	big := &content.Entry{URL: "https://x.example/big2", Body: strings.Repeat("word ", syncRender/4)}
+	m := Model{st: newStyles(true), width: 80, height: 20, vp: viewport.New()}
+	m.entry = big
+	m.screen = screenReader
+	m.renderEntry(0.7)
+	tm, _ := m.Update(tea.WindowSizeMsg{Width: 70, Height: 20})
+	if got := tm.(Model).keepPos; got != 0.7 {
+		t.Errorf("keepPos = %v, want 0.7", got)
+	}
+}

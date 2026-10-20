@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -178,6 +179,16 @@ func (c *Client) StartRound() {
 func (c *Client) Keep(rawURL string) {
 	if u, err := url.Parse(rawURL); err == nil {
 		c.touch(ASCIIHost(u).String())
+	}
+}
+
+// Unmove forgets a remembered redirect for rawURL, leaving the target's
+// validators alone.
+func (c *Client) Unmove(rawURL string) {
+	if u, err := url.Parse(rawURL); err == nil {
+		c.mu.Lock()
+		delete(c.moved, ASCIIHost(u).String())
+		c.mu.Unlock()
 	}
 }
 
@@ -554,6 +565,8 @@ func (c *Client) follow(ctx context.Context, u *url.URL, start, accept string, c
 	}
 }
 
+var xmlEncoding = regexp.MustCompile(`^(?:\xef\xbb\xbf)?\s*<\?xml[^>]*\sencoding=["']([A-Za-z0-9._:-]+)["']`)
+
 // toUTF8 converts HTML, markdown and plain text in another charset, like
 // windows-1254 or ISO-8859-9, to UTF-8. The charset comes from the
 // Content-Type header or, for HTML, a meta tag. XML feeds and sitemaps are
@@ -578,6 +591,17 @@ func toUTF8(body []byte, mediaType, header string) []byte {
 	_, params, _ := mime.ParseMediaType(header)
 	if params["charset"] == "" && utf8.Valid(body) {
 		return body
+	}
+	// XHTML often declares its encoding only in the XML declaration, which
+	// the charset package doesn't read.
+	if isPage && params["charset"] == "" {
+		if m := xmlEncoding.FindSubmatch(body[:min(len(body), 256)]); m != nil {
+			if r, err := charset.NewReaderLabel(string(m[1]), bytes.NewReader(body)); err == nil {
+				if out, err := io.ReadAll(r); err == nil {
+					return out
+				}
+			}
+		}
 	}
 	if strings.EqualFold(params["charset"], "utf-8") {
 		return body

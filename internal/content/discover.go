@@ -223,7 +223,7 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 	// The sitemap adds pages the feed doesn't list.
 	seen := map[string]bool{normalize(d.Base): true}
 	// When the site URL names a file, its directory is the same listing.
-	seen[normalize(d.Base.ResolveReference(&url.URL{Path: scope}))] = true
+	seen[d.homeDir()] = true
 	for _, raw := range append([]string{feedURL}, entryURLs(entries)...) {
 		if k, ok := key(raw); ok && raw != "" {
 			seen[k] = true
@@ -291,12 +291,17 @@ func entryURLs(entries []*Entry) []string {
 // finish sorts entries, fills missing titles and indexes the site.
 func finish(site *Site, kept []*Entry) *Site {
 	for _, e := range kept {
-		h := fnv.New64a()
-		h.Write([]byte(e.Body))
-		e.bodyHash = h.Sum64()
-		if e.Title == "" {
+		if !e.hashed {
+			h := fnv.New64a()
+			h.Write([]byte(e.Body))
+			e.bodyHash, e.hashed = h.Sum64(), true
+		}
+		if e.Title == "" && e.URL != "" {
 			// The URL path is percent-decoded and can hold control bytes.
 			e.Title = sanitize.Line(titleFromURL(e.URL))
+		}
+		if e.Title == "" {
+			e.Title = "Untitled"
 		}
 	}
 	sort.SliceStable(kept, func(i, j int) bool {
@@ -383,31 +388,47 @@ func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []feedLink,
 			continue
 		}
 		entries := make([]*Entry, 0, len(feed.Items))
-		seenItem := map[string]bool{}
+		seenItem, seenGUID := map[string]bool{}, map[string]bool{}
 		for _, item := range feed.Items {
 			e := entryFromItem(item, res.URL)
 			if e == nil {
 				continue
 			}
-			// A site-wide feed found from a /blog site only counts for
-			// its /blog posts. Items without a URL can't be placed, so a
-			// scoped site leaves them out. Feeds sometimes list a post
-			// twice, or under both www and bare hosts, so the first wins.
-			if e.URL == "" {
-				if scope != "/" {
+			guid := strings.TrimSpace(item.GUID)
+			if guid != "" {
+				if seenGUID[guid] {
 					continue
 				}
-			} else {
+				seenGUID[guid] = true
+			}
+			if e.URL != "" {
+				// A site-wide feed found from a /blog site only counts
+				// for its /blog posts.
 				u, err := url.Parse(e.URL)
 				if err != nil || !inScope(u, scope) {
 					continue
 				}
-				// An item linking to the homepage itself isn't a post.
 				k := normalize(u)
-				if seenItem[k] || k == normalize(d.Base) {
+				switch {
+				case d.isHome(k), seenItem[k] && guid != "":
+					// Several items can share one link, often the
+					// homepage, each with its own text, as changelogs
+					// and microblogs do. Keep those as text-only entries.
+					if strings.TrimSpace(e.Body) == "" {
+						continue
+					}
+					e.URL = ""
+				case seenItem[k]:
+					// The same post listed twice, or under both www and
+					// bare hosts. The first wins.
 					continue
+				default:
+					seenItem[k] = true
 				}
-				seenItem[k] = true
+			}
+			// Text-only items can't be placed in a scoped site's path.
+			if e.URL == "" && scope != "/" {
+				continue
 			}
 			entries = append(entries, e)
 		}
@@ -611,7 +632,16 @@ func (d *Discoverer) fillBody(ctx context.Context, e *Entry, old *Entry) error {
 	// A page that now redirects to the homepage, a login page outside the
 	// site's path and so on isn't this entry anymore.
 	if err == nil && res.Status == 200 && d.redirectedAway(u, res.URL) {
-		d.Client.Forget(e.URL)
+		// Forget the redirect, but not the target's validators, which may
+		// be the homepage's own.
+		d.Client.Unmove(e.URL)
+		// It may be a maintenance redirect, so keep an old copy for a few
+		// refreshes, as for a page that can't be read.
+		if hasOld && old.stale < maxStale {
+			reuse(e, old)
+			e.stale = old.stale + 1
+			return fmt.Errorf("redirects away to %q, kept previous copy", res.URL)
+		}
 		return fmt.Errorf("redirects away to %q", res.URL)
 	}
 	switch {
@@ -661,7 +691,17 @@ func (d *Discoverer) redirectedAway(from, to *url.URL) bool {
 	if normalize(from) == normalize(to) {
 		return false
 	}
-	return normalize(to) == normalize(d.Base) || !inScope(to, d.scope())
+	return d.isHome(normalize(to)) || !inScope(to, d.scope())
+}
+
+// isHome reports whether the normalized key k is the site's homepage: the
+// site URL, or its directory when the site URL names a file.
+func (d *Discoverer) isHome(k string) bool {
+	return k == normalize(d.Base) || k == d.homeDir()
+}
+
+func (d *Discoverer) homeDir() string {
+	return normalize(d.Base.ResolveReference(&url.URL{Path: d.scope()}))
 }
 
 // keepPrevious reports whether a fetch result means an earlier copy should
@@ -740,6 +780,7 @@ func applyPublished(e *Entry, t time.Time) {
 // reuse copies old's page content into e, keeping the feed's own fields.
 func reuse(e, old *Entry) {
 	e.Body, e.fetchedAt, e.stale, e.base = old.Body, old.fetchedAt, old.stale, old.base
+	e.bodyHash, e.hashed = old.bodyHash, old.hashed
 	// Feed entries are posts whatever the page looked like last time.
 	if !e.fromFeed {
 		e.Kind = old.Kind

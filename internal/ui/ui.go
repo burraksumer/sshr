@@ -48,16 +48,18 @@ type Model struct {
 	visible        []*content.Entry
 
 	// reader
-	resizeGen int
-	renders   *rate.Limiter // re-renders after resizes
-	resizing  bool          // a resize is waiting to settle
-	keepPos   float64       // reading position from before it started
-	entry     *content.Entry
-	doc       render.Document
-	vp        viewport.Model
-	digits    string
-	history   []visit
-	status    string
+	resizeGen  int
+	pending    bool          // a render is running in the background
+	pendingPos float64       // where it will open
+	renders    *rate.Limiter // re-renders after resizes
+	resizing   bool          // a resize is waiting to settle
+	keepPos    float64       // reading position from before it started
+	entry      *content.Entry
+	doc        render.Document
+	vp         viewport.Model
+	digits     string
+	history    []visit
+	status     string
 }
 
 // New returns a model that reads from store.
@@ -183,7 +185,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// and render the text once the size settles, at the position the
 		// reader was at before the first of them.
 		if !m.resizing {
-			m.keepPos, m.resizing = readingPosition(m.vp), true
+			m.keepPos, m.resizing = m.position(), true
 		}
 		m.vp.SetWidth(m.width)
 		m.vp.SetHeight(max(m.height-1, 1))
@@ -216,7 +218,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.dark = dark
 			m.st = newStyles(dark)
 			if m.entry != nil {
-				return m, m.renderEntry(readingPosition(m.vp))
+				return m, m.renderEntry(m.position())
 			}
 		}
 		return m, nil
@@ -415,7 +417,7 @@ func (m *Model) open(e *content.Entry, push bool) tea.Cmd {
 		m.filter.Blur()
 	}
 	if push && m.entry != nil {
-		m.history = append(m.history, visit{m.entry, readingPosition(m.vp)})
+		m.history = append(m.history, visit{m.entry, m.position()})
 	}
 	m.entry = e
 	m.screen = screenReader
@@ -457,6 +459,7 @@ func (m *Model) renderEntry(pos float64) tea.Cmd {
 		return nil
 	}
 	m.doc = render.Document{}
+	m.pending, m.pendingPos = true, pos
 	m.vp.SetContent(m.header() + "\n  " + m.st.dim.Render("Rendering…") + "\n")
 	e := m.entry
 	return func() tea.Msg {
@@ -489,9 +492,19 @@ func (m *Model) header() string {
 // Rewrapping changes the line count, so the position is a fraction of the
 // document rather than a line number.
 func (m *Model) show(doc render.Document, pos float64) {
-	m.doc = doc
+	m.doc, m.pending = doc, false
 	m.vp.SetContent(m.header() + doc.Content + "\n")
 	m.vp.SetYOffset(int(pos * float64(max(m.vp.TotalLineCount()-m.vp.Height(), 0))))
+}
+
+// position is the reading position in the current entry. While a render is
+// pending, the viewport holds a placeholder, so it's where the render will
+// open.
+func (m *Model) position() float64 {
+	if m.pending {
+		return m.pendingPos
+	}
+	return readingPosition(m.vp)
 }
 
 // readingPosition is how far down the document the viewport is, from 0 at

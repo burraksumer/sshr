@@ -33,6 +33,7 @@ type Entry struct {
 	// fetchedAt is when the page was last fetched or confirmed unchanged.
 	fetchedAt time.Time
 	bodyHash  uint64
+	hashed    bool // bodyHash is set for the current Body
 	// stale counts refreshes in a row that kept this copy because the page
 	// couldn't be read.
 	stale int
