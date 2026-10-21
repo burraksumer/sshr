@@ -2,6 +2,7 @@ package ui
 
 import (
 	"bytes"
+	"fmt"
 	"image"
 	"image/png"
 	"net/http"
@@ -16,6 +17,8 @@ import (
 	"github.com/burraksumer/sshr/internal/content"
 	"github.com/burraksumer/sshr/internal/fetch"
 	"github.com/burraksumer/sshr/internal/images"
+	uv "github.com/charmbracelet/ultraviolet"
+	"github.com/charmbracelet/x/ansi/kitty"
 )
 
 func key(s string) tea.KeyPressMsg {
@@ -234,4 +237,98 @@ func TestImageViewer(t *testing.T) {
 	if m.screen != screenReader || !strings.Contains(m.status, "/cat.png") {
 		t.Errorf("images off: screen %v, status %q", m.screen, m.status)
 	}
+}
+
+func rawOf(t *testing.T, cmd tea.Cmd) string {
+	t.Helper()
+	if cmd == nil {
+		t.Fatal("no command")
+	}
+	switch msg := cmd().(type) {
+	case tea.RawMsg:
+		return fmt.Sprint(msg.Msg)
+	case tea.BatchMsg:
+		for _, c := range msg {
+			if c == nil {
+				continue
+			}
+			// The batch's other commands are ticks, which would wait.
+			if _, tick := c().(resizedMsg); !tick {
+				return rawOf(t, c)
+			}
+		}
+		t.Fatal("no raw output in the batch")
+	default:
+		t.Fatalf("command gave %T, not raw output", msg)
+	}
+	return ""
+}
+
+func TestKittyViewer(t *testing.T) {
+	var b bytes.Buffer
+	png.Encode(&b, image.NewRGBA(image.Rect(0, 0, 96, 64)))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write(b.Bytes()) }))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	loader := images.New(fetch.New(fetch.Options{Hosts: []string{u.Host}, Rate: 1000, Burst: 100}))
+	m := Model{st: newStyles(true), width: 60, height: 20, vp: viewport.New(), images: loader, site: &content.Site{}}
+
+	// Only kitty and Ghostty are asked, and only an OK turns it on.
+	var tm tea.Model = m
+	if _, cmd := tm.Update(tea.EnvMsg{"TERM=xterm-256color"}); cmd != nil {
+		t.Error("asked a terminal without placeholders")
+	}
+	tm, cmd := tm.Update(tea.EnvMsg{"TERM=xterm-ghostty"})
+	if !strings.Contains(rawOf(t, cmd), "a=q") {
+		t.Error("no query")
+	}
+	tm, _ = tm.Update(uv.KittyGraphicsEvent{Options: kittyOpts(images.KittyQueryID), Payload: []byte("ENOTSUPPORTED")})
+	if tm.(Model).kitty {
+		t.Error("kitty on after an error")
+	}
+	tm, _ = tm.Update(uv.KittyGraphicsEvent{Options: kittyOpts(images.KittyQueryID), Payload: []byte("OK")})
+	m = tm.(Model)
+	if !m.kitty {
+		t.Fatal("kitty off after OK")
+	}
+
+	m.open(&content.Entry{URL: srv.URL + "/post", Body: "![cat](/cat.png)"}, false)
+	cmd = m.follow(1)
+	if m.picID != 16 {
+		t.Errorf("image id %d", m.picID)
+	}
+	tm, cmd = m.Update(cmd())
+	// The data goes out with a placement sized like the placeholders.
+	tm, place := tm.Update(cmd())
+	m = tm.(Model)
+	out := rawOf(t, place)
+	if !strings.Contains(out, "a=t,f=100,t=d,i=16") || !strings.HasSuffix(out, images.KittyPlace(16, 12, 4)) {
+		t.Errorf("transmission ends %q", out[max(len(out)-60, 0):])
+	}
+	if len(m.picLines) != 4 || !strings.Contains(m.viewImage(), "\U0010EEEE") || strings.Contains(m.viewImage(), "▀") {
+		t.Errorf("viewer:\n%s", m.viewImage())
+	}
+	// A smaller window moves the image onto fewer cells.
+	tm, cmd = m.Update(tea.WindowSizeMsg{Width: 20, Height: 8})
+	if got := rawOf(t, cmd); got != images.KittyPlace(16, 6, 2) {
+		t.Errorf("resize sent %q", got)
+	}
+	// Leaving frees it, and a late transmission for it is dropped.
+	tm, cmd = tm.Update(key("h"))
+	if got := rawOf(t, cmd); got != images.KittyDelete(16) {
+		t.Errorf("leaving sent %q", got)
+	}
+	if _, cmd := tm.Update(kittyDataMsg{16, "late"}); cmd != nil {
+		t.Error("late transmission sent")
+	}
+	// The next image gets a new id.
+	m = tm.(Model)
+	m.follow(1)
+	if m.picID != 17 {
+		t.Errorf("next id %d", m.picID)
+	}
+}
+
+func kittyOpts(id int) kitty.Options {
+	return kitty.Options{ID: id}
 }

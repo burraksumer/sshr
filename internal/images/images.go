@@ -31,9 +31,10 @@ const (
 	// maxPixels caps an image's decoded size, about 48 MB at four bytes a
 	// pixel. Images with 16 bits a channel count double.
 	maxPixels = 12_000_000
-	// maxSide is the largest width or height kept after decoding. A
-	// terminal rarely shows more than 300 by 160 pixels in half blocks.
-	maxSide = 512
+	// maxSide is the largest width or height kept after decoding. Half
+	// blocks rarely show more than 300 by 160 pixels, but kitty and Ghostty
+	// show real pixels.
+	maxSide = 1024
 	// cacheBytes bounds the decoded images kept for all sessions.
 	cacheBytes = 32 << 20
 	// keepFor is how long an image is cached before it is fetched again,
@@ -55,6 +56,7 @@ var ErrUnsupported = errors.New("not a PNG, JPEG, GIF or WebP image")
 const Accept = "image/png,image/jpeg,image/gif,image/webp;q=0.9"
 
 // Image is a decoded picture, scaled down to at most maxSide on each side.
+// It is shared by sessions and never changed.
 type Image struct {
 	// Pix is premultiplied, as image.RGBA is.
 	Pix *image.RGBA

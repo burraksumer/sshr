@@ -18,6 +18,7 @@ import (
 	"github.com/burraksumer/sshr/internal/images"
 	"github.com/burraksumer/sshr/internal/render"
 	"github.com/burraksumer/sshr/internal/sanitize"
+	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/charmbracelet/x/ansi"
 	"golang.org/x/time/rate"
 )
@@ -72,6 +73,13 @@ type Model struct {
 	picImg   *images.Image
 	picErr   error
 	picLines []string
+
+	// kitty graphics, for terminals that answered the query
+	kitty            bool
+	picID            int // the viewer's image in the terminal, or 0
+	lastID           int
+	picSent          bool // the image data went out
+	picCols, picRows int
 }
 
 // New returns a model that reads from store and loads images with loader,
@@ -191,9 +199,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.clampOffset()
-		m.drawPic()
+		place := m.drawPic()
 		if m.entry == nil {
-			return m, nil
+			return m, place
 		}
 		// Dragging a window edge sends many sizes. Resize the viewport now
 		// and render the text once the size settles, at the position the
@@ -205,7 +213,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.vp.SetHeight(max(m.height-1, 1))
 		m.resizeGen++
 		gen := m.resizeGen
-		return m, tea.Tick(resizeSettle, func(time.Time) tea.Msg { return resizedMsg{gen} })
+		return m, tea.Batch(place, tea.Tick(resizeSettle, func(time.Time) tea.Msg { return resizedMsg{gen} }))
 
 	case resizedMsg:
 		if msg.gen != m.resizeGen || m.entry == nil {
@@ -225,6 +233,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.screen == screenImage && msg.url == m.pic.URL && m.picImg == nil && m.picErr == nil {
 			m.picImg, m.picErr = msg.img, msg.err
 			m.drawPic()
+			if m.picID != 0 && m.picImg != nil {
+				id, img := m.picID, m.picImg
+				return m, func() tea.Msg { return kittyDataMsg{id, images.KittyTransmit(id, img)} }
+			}
+		}
+		return m, nil
+
+	case kittyDataMsg:
+		// The viewer may have closed or moved on while the PNG was encoded.
+		if msg.id != m.picID || m.picSent || msg.data == "" {
+			return m, nil
+		}
+		m.picSent = true
+		return m, tea.Raw(msg.data + images.KittyPlace(m.picID, m.picCols, m.picRows))
+
+	case tea.EnvMsg:
+		// Only kitty and Ghostty are asked, since they show Unicode
+		// placeholders. Other terminals that answer the query may not.
+		if m.images != nil && kittyTerm(msg.Getenv("TERM")) {
+			return m, tea.Raw(images.KittyQuery)
+		}
+		return m, nil
+
+	case uv.KittyGraphicsEvent:
+		if msg.Options.ID == images.KittyQueryID && string(msg.Payload) == "OK" {
+			m.kitty = true
 		}
 		return m, nil
 
@@ -251,7 +285,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyPressMsg:
 		if msg.String() == "ctrl+c" {
-			return m, tea.Quit
+			return m, tea.Sequence(m.closePic(), tea.Quit)
 		}
 		switch m.screen {
 		case screenHelp:
@@ -262,7 +296,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case screenImage:
 			switch msg.String() {
 			case "esc", "q", "h", "left", "backspace":
-				m.screen, m.picImg, m.picErr, m.picLines = screenReader, nil, nil, nil
+				cmd := m.closePic()
+				m.screen = screenReader
+				return m, cmd
 			case "?":
 				m.prev, m.screen = m.screen, screenHelp
 			}
@@ -454,9 +490,33 @@ type imageMsg struct {
 // going after that, so a later look may find it cached.
 const imageWait = 40 * time.Second
 
+// kittyDataMsg carries an encoded image for the terminal.
+type kittyDataMsg struct {
+	id   int
+	data string
+}
+
+// kittyTerm reports whether term names a terminal with Unicode placeholder
+// support.
+func kittyTerm(term string) bool {
+	return term == "xterm-kitty" || term == "xterm-ghostty"
+}
+
 // viewPic opens the image viewer on link and starts loading it.
 func (m *Model) viewPic(link render.Link) tea.Cmd {
 	m.screen, m.pic, m.picImg, m.picErr, m.picLines = screenImage, link, nil, nil, nil
+	m.picSent, m.picCols, m.picRows = false, 0, 0
+	if m.kitty {
+		// Ids start at 16, because the placeholders name the image with a
+		// 256-color index, and a renderer may rewrite 0 to 15 as basic
+		// colors. Each image gets a new id, so a late transmission can't
+		// land on the next image.
+		m.lastID++
+		if m.lastID < 16 || m.lastID > 255 {
+			m.lastID = 16
+		}
+		m.picID = m.lastID
+	}
 	loader, u := m.images, link.URL
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), imageWait)
@@ -466,16 +526,46 @@ func (m *Model) viewPic(link render.Link) tea.Cmd {
 	}
 }
 
-// drawPic draws the viewer's image for the current window size.
-func (m *Model) drawPic() {
+// closePic leaves the viewer's image, freeing it in the terminal.
+func (m *Model) closePic() tea.Cmd {
+	var cmd tea.Cmd
+	if m.picID != 0 {
+		cmd = tea.Raw(images.KittyDelete(m.picID))
+	}
+	m.picImg, m.picErr, m.picLines, m.picID, m.picSent = nil, nil, nil, 0, false
+	return cmd
+}
+
+// drawPic draws the viewer's image for the current window size. With kitty
+// graphics it lays out placeholders, and returns the command that moves the
+// image onto them when their size changed.
+func (m *Model) drawPic() tea.Cmd {
 	if m.screen != screenImage || m.picImg == nil {
-		return
+		return nil
+	}
+	cols, rows := max(m.width-2, 1), max(m.height-picChrome, 1)
+	if m.picID != 0 {
+		c, r := images.KittySize(m.picImg, cols, rows)
+		pad := strings.Repeat(" ", (cols-c)/2)
+		m.picLines = images.KittyCells(m.picID, c, r)
+		for i := range m.picLines {
+			m.picLines[i] = pad + m.picLines[i]
+		}
+		if c == m.picCols && r == m.picRows {
+			return nil
+		}
+		m.picCols, m.picRows = c, r
+		if m.picSent {
+			return tea.Raw(images.KittyPlace(m.picID, c, r))
+		}
+		return nil
 	}
 	bg := color.RGBA{0, 0, 0, 255}
 	if !m.dark {
 		bg = color.RGBA{255, 255, 255, 255}
 	}
-	m.picLines = images.Draw(m.picImg, max(m.width-2, 1), max(m.height-picChrome, 1), bg)
+	m.picLines = images.Draw(m.picImg, cols, rows, bg)
+	return nil
 }
 
 // picChrome is the number of lines around the image in the viewer: a blank
