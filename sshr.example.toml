@@ -31,3 +31,7 @@ url = "https://example.com"
 # trusted_proxies = ["10.0.0.0/8"]
 
 # log_format = "json"     # or "text"
+
+# Let visitors view the site's images. sshr fetches them from the same hosts
+# as its pages.
+# images = true

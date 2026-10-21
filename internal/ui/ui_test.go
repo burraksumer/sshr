@@ -1,6 +1,12 @@
 package ui
 
 import (
+	"bytes"
+	"image"
+	"image/png"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -8,6 +14,8 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/burraksumer/sshr/internal/content"
+	"github.com/burraksumer/sshr/internal/fetch"
+	"github.com/burraksumer/sshr/internal/images"
 )
 
 func key(s string) tea.KeyPressMsg {
@@ -86,7 +94,7 @@ func TestResizeKeepsTopOfShortPost(t *testing.T) {
 }
 
 func TestPasteIntoSearch(t *testing.T) {
-	m := New(content.NewStore(&content.Discoverer{}, nil))
+	m := New(content.NewStore(&content.Discoverer{}, nil), nil)
 	m.site = &content.Site{Entries: []*content.Entry{{Title: "golang notes"}, {Title: "other"}}}
 	m.applyFilter()
 	var tm tea.Model = m
@@ -159,5 +167,71 @@ func TestResizeDoesNotLeakToNextEntry(t *testing.T) {
 	got = tm.(Model)
 	if off := got.vp.YOffset(); off != 0 {
 		t.Errorf("entry b opened at offset %d, want 0", off)
+	}
+}
+
+func TestImageViewer(t *testing.T) {
+	var b bytes.Buffer
+	img := image.NewRGBA(image.Rect(0, 0, 8, 8))
+	for i := range img.Pix {
+		img.Pix[i] = 0xff
+	}
+	png.Encode(&b, img)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/cat.png" {
+			w.Write(b.Bytes())
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	loader := images.New(fetch.New(fetch.Options{Hosts: []string{u.Host}, Rate: 1000, Burst: 100}))
+
+	entry := &content.Entry{URL: srv.URL + "/post", Body: "A ![white cat](/cat.png) and ![gone](/gone.png)."}
+	m := Model{st: newStyles(true), width: 60, height: 20, vp: viewport.New(), images: loader, site: &content.Site{}}
+	m.open(entry, false)
+	if len(m.doc.Links) != 2 || !m.doc.Links[0].Image {
+		t.Fatalf("links = %+v", m.doc.Links)
+	}
+	var tm tea.Model = m
+	tm, _ = tm.(Model).Update(key("1"))
+	tm, cmd := tm.(Model).Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	got := tm.(Model)
+	if got.screen != screenImage || !strings.Contains(got.viewImage(), "Loading") {
+		t.Fatalf("screen %v:\n%s", got.screen, got.viewImage())
+	}
+	tm, _ = got.Update(cmd())
+	got = tm.(Model)
+	view := got.viewImage()
+	if len(got.picLines) == 0 || !strings.Contains(view, "white cat") || !strings.Contains(view, "8×8 png") || !strings.Contains(view, "▀") {
+		t.Errorf("viewer:\n%s", view)
+	}
+	if lines := strings.Count(view, "\n") + 1; lines != got.height {
+		t.Errorf("viewer has %d lines, want %d", lines, got.height)
+	}
+	tm, _ = got.Update(tea.WindowSizeMsg{Width: 30, Height: 12})
+	if l := tm.(Model).picLines; len(l) > 12-picChrome {
+		t.Errorf("%d image lines after a resize", len(l))
+	}
+	tm, _ = tm.(Model).Update(key("h"))
+	if got := tm.(Model); got.screen != screenReader || got.picImg != nil {
+		t.Errorf("back went to %v", got.screen)
+	}
+
+	// A missing image says so.
+	got = tm.(Model)
+	got.width = 80
+	cmd = got.follow(2)
+	tm, _ = got.Update(cmd())
+	if view := tm.(Model).viewImage(); !strings.Contains(view, "Couldn't load the image") || !strings.Contains(view, "404") {
+		t.Errorf("missing image:\n%s", view)
+	}
+
+	// With images off, the number shows the image's address.
+	m.images = nil
+	m.follow(1)
+	if m.screen != screenReader || !strings.Contains(m.status, "/cat.png") {
+		t.Errorf("images off: screen %v, status %q", m.screen, m.status)
 	}
 }

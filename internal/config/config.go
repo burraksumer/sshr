@@ -41,6 +41,10 @@ type Config struct {
 
 	// LogFormat is "json" or "text".
 	LogFormat string `toml:"log_format"`
+
+	// Images lets visitors view the site's images, which sshr fetches
+	// from the same hosts as its pages.
+	Images bool `toml:"images"`
 }
 
 // Default returns the configuration used when a field is not set.
@@ -56,6 +60,7 @@ func Default() Config {
 		IdleTimeout: Duration(15 * time.Minute),
 		MaxSession:  Duration(2 * time.Hour),
 		LogFormat:   "json",
+		Images:      true,
 	}
 }
 

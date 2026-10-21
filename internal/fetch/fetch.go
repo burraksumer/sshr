@@ -392,7 +392,7 @@ func (c *Client) robotsLock(key string) *sync.Mutex {
 func (c *Client) fetchRobots(ctx context.Context, u *url.URL) (robotsEntry, error) {
 	ru := u.ResolveReference(&url.URL{Path: "/robots.txt"})
 	e := robotsEntry{data: disallowAll, unavailable: true}
-	resp, err := c.get(ctx, ru, "text/plain", false, false, -maxRobotsBytes)
+	resp, err := c.get(ctx, ru, request{accept: "text/plain", maxBytes: -maxRobotsBytes})
 	switch {
 	case errors.Is(err, ErrNotAllowed), errors.Is(err, ErrPermanent):
 		// robots.txt redirects to a host sshr won't contact, like a CDN,
@@ -468,29 +468,50 @@ func (c *Client) LoadRobots(ctx context.Context, base *url.URL) ([]string, error
 // Get fetches u. When conditional is true and the client has validators from
 // an earlier response, it sends If-None-Match and If-Modified-Since.
 func (c *Client) Get(ctx context.Context, u *url.URL, accept string, conditional bool) (*Response, error) {
-	return c.get(ctx, u, accept, conditional, true, c.maxBytes)
+	return c.get(ctx, u, request{accept: accept, conditional: conditional, checkRobots: true, maxBytes: c.maxBytes})
 }
 
 // GetLarge is Get with a larger size limit, for feeds that carry the full
 // text of many posts.
 func (c *Client) GetLarge(ctx context.Context, u *url.URL, accept string, conditional bool) (*Response, error) {
-	return c.get(ctx, u, accept, conditional, true, 5*c.maxBytes)
+	return c.get(ctx, u, request{accept: accept, conditional: conditional, checkRobots: true, maxBytes: 5 * c.maxBytes})
 }
 
-func (c *Client) get(ctx context.Context, u *url.URL, accept string, conditional, checkRobots bool, maxBytes int64) (*Response, error) {
+// GetBinary fetches a file like an image, of at most maxBytes, with the same
+// allowlist, robots.txt and rate limits as Get. The body is returned as sent,
+// and nothing about the URL is remembered for later requests.
+func (c *Client) GetBinary(ctx context.Context, u *url.URL, accept string, maxBytes int64) (*Response, error) {
+	return c.get(ctx, u, request{accept: accept, checkRobots: true, binary: true, maxBytes: maxBytes})
+}
+
+// request describes one Get.
+type request struct {
+	accept      string
+	conditional bool
+	checkRobots bool
+	// binary skips charset conversion and keeps no validators or redirects.
+	binary bool
+	// maxBytes caps the body. A negative limit cuts the body at that size
+	// instead of failing.
+	maxBytes int64
+}
+
+func (c *Client) get(ctx context.Context, u *url.URL, r request) (*Response, error) {
 	// A URL that moved permanently is asked for at its new place, so a
 	// conditional request can get a 304 instead of a redirect.
 	// Keys use the ASCIIHost form, the same one do stores validators under.
 	start := ASCIIHost(u).String()
 	// A URL that was asked for keeps its validators, even if the request
 	// fails before it is sent, like during a robots.txt outage.
-	c.touch(start)
-	if conditional {
+	if !r.binary {
+		c.touch(start)
+	}
+	if r.conditional {
 		c.mu.Lock()
 		m, ok := c.moved[start]
 		c.mu.Unlock()
 		if to, err := url.Parse(m.to); ok && err == nil {
-			res, err := c.follow(ctx, to, start, accept, conditional, checkRobots, maxBytes)
+			res, err := c.follow(ctx, to, start, r)
 			// Keep the mapping only while the new place answers directly.
 			// If it redirects elsewhere or is gone, forget it, and when it
 			// is gone, the old URL may work again.
@@ -508,17 +529,17 @@ func (c *Client) get(ctx context.Context, u *url.URL, accept string, conditional
 			}
 			c.mu.Unlock()
 			if err == nil && (res.Status == http.StatusNotFound || res.Status == http.StatusGone) {
-				return c.follow(ctx, u, start, accept, conditional, checkRobots, maxBytes)
+				return c.follow(ctx, u, start, r)
 			}
 			return res, err
 		}
 	}
-	return c.follow(ctx, u, start, accept, conditional, checkRobots, maxBytes)
+	return c.follow(ctx, u, start, r)
 }
 
 // follow requests u and follows its redirects. start is the URL the caller
 // asked for, under which a permanent redirect is remembered.
-func (c *Client) follow(ctx context.Context, u *url.URL, start, accept string, conditional, checkRobots bool, maxBytes int64) (*Response, error) {
+func (c *Client) follow(ctx context.Context, u *url.URL, start string, r request) (*Response, error) {
 	permanent := true
 	// Redirects are followed here rather than by net/http, so every hop gets
 	// the allowlist and robots.txt checks, waits on the rate limiter, and has
@@ -533,7 +554,7 @@ func (c *Client) follow(ctx context.Context, u *url.URL, start, accept string, c
 		// Request the host in the exact form that was checked, so the name
 		// net/http dials is the allowlisted one by construction.
 		u = ASCIIHost(u)
-		if checkRobots {
+		if r.checkRobots {
 			if allowed, unavailable := c.robotsAllow(ctx, u); !allowed {
 				return nil, robotsError(u, unavailable)
 			}
@@ -547,13 +568,13 @@ func (c *Client) follow(ctx context.Context, u *url.URL, start, accept string, c
 		// Validators are only worth storing where a conditional request can
 		// send them: the first hop, or a target reached by permanent
 		// redirects. robots.txt is never asked for conditionally.
-		remember := checkRobots && (hop == 0 || permanent)
-		res, next, status, err := c.do(ctx, u, accept, conditional && hop == 0, remember, maxBytes)
+		remember := r.checkRobots && !r.binary && (hop == 0 || permanent)
+		res, next, status, err := c.do(ctx, u, r, r.conditional && hop == 0, remember)
 		if err != nil {
 			return nil, err
 		}
 		if next == nil {
-			if hop > 0 && permanent && res.Status == http.StatusOK {
+			if hop > 0 && permanent && res.Status == http.StatusOK && !r.binary {
 				c.mu.Lock()
 				c.moved[start] = moved{to: u.String(), round: c.round}
 				c.mu.Unlock()
@@ -635,7 +656,7 @@ var ErrPermanent = errors.New("fetch: permanent failure")
 // do sends one request. For a redirect it returns the next URL instead of
 // a response. A positive maxBytes makes a larger body an error, and a
 // negative one cuts the body to -maxBytes bytes.
-func (c *Client) do(ctx context.Context, u *url.URL, accept string, conditional, remember bool, maxBytes int64) (*Response, *url.URL, int, error) {
+func (c *Client) do(ctx context.Context, u *url.URL, r request, conditional, remember bool) (*Response, *url.URL, int, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
@@ -643,8 +664,8 @@ func (c *Client) do(ctx context.Context, u *url.URL, accept string, conditional,
 		return nil, nil, 0, err
 	}
 	req.Header.Set("User-Agent", UserAgent)
-	if accept != "" {
-		req.Header.Set("Accept", accept)
+	if r.accept != "" {
+		req.Header.Set("Accept", r.accept)
 	}
 	key := u.String()
 	sent := false
@@ -698,7 +719,7 @@ func (c *Client) do(ctx context.Context, u *url.URL, accept string, conditional,
 	if mt, _, err := mime.ParseMediaType(res.Header.Get("Content-Type")); err == nil {
 		out.ContentType = strings.ToLower(mt)
 	}
-	limit := maxBytes
+	limit := r.maxBytes
 	if limit < 0 {
 		limit = -limit
 	}
@@ -707,7 +728,7 @@ func (c *Client) do(ctx context.Context, u *url.URL, accept string, conditional,
 		return nil, nil, 0, err
 	}
 	if int64(len(body)) > limit {
-		if maxBytes > 0 {
+		if r.maxBytes > 0 {
 			return nil, nil, 0, fmt.Errorf("%w: %q is larger than %d bytes", ErrPermanent, u, limit)
 		}
 		// Cut at the last line break, so a rule isn't left half written.
@@ -716,7 +737,10 @@ func (c *Client) do(ctx context.Context, u *url.URL, accept string, conditional,
 			body = body[:i+1]
 		}
 	}
-	out.Body = toUTF8(body, out.ContentType, res.Header.Get("Content-Type"))
+	out.Body = body
+	if !r.binary {
+		out.Body = toUTF8(body, out.ContentType, res.Header.Get("Content-Type"))
+	}
 
 	if res.StatusCode == http.StatusOK && remember {
 		v := validators{etag: res.Header.Get("ETag"), lastModified: res.Header.Get("Last-Modified")}

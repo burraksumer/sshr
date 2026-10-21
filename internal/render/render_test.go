@@ -1,6 +1,7 @@
 package render
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 	"sync"
@@ -312,5 +313,28 @@ func TestLinkNumbersFollowReadingOrder(t *testing.T) {
 	}
 	if plain := ansi.Strip(doc.Content); !strings.Contains(plain, "docs [1]") || !strings.Contains(plain, "https://b.example/y [2]") {
 		t.Errorf("numbers out of order:\n%s", plain)
+	}
+}
+
+func TestImagesNumbered(t *testing.T) {
+	md := "Intro ![A cat &amp; dog](/cat.png) and [![logo](https://x.example/l.png) home](https://x.example/) and ![](data:image/png;base64,AAAA), ![x]() and ![](</a b.png>) and ![again](/cat.png)\n"
+	doc, err := Markdown(md, Options{Width: 120, BaseURL: "https://x.example/post"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := ansi.Strip(doc.Content)
+	for _, want := range []string{"[image: A cat & dog] [1]", "[image: logo] [2] home [3]", "and [image], [image: x] and [image] [4]", "[image: again] [1]", "[1] image https://x.example/cat.png", "[3] https://x.example/\n"} {
+		if !strings.Contains(regexp.MustCompile(` +\n`).ReplaceAllString(text, "\n"), want) {
+			t.Errorf("missing %q in:\n%s", want, text)
+		}
+	}
+	want := []Link{
+		{N: 1, URL: "https://x.example/cat.png", Image: true, Alt: "A cat & dog"},
+		{N: 2, URL: "https://x.example/l.png", Image: true, Alt: "logo"},
+		{N: 3, URL: "https://x.example/"},
+		{N: 4, URL: "https://x.example/a%20b.png", Image: true},
+	}
+	if fmt.Sprint(doc.Links) != fmt.Sprint(want) {
+		t.Errorf("links = %+v", doc.Links)
 	}
 }

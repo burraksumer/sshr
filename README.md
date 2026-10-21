@@ -76,10 +76,18 @@ sshr reads `sshr.toml` from the working directory if it exists. A file named wit
 | Reader | |
 |---|---|
 | `↑` `↓` `j` `k`, `space` `b` | scroll |
-| `3` `enter` | follow link [3] |
+| `3` `enter` | follow link [3], or view it if it's an image |
 | `h` `esc` `q` | back |
 
 Links are numbered in the text, and the full URLs are listed at the end of each entry. A link to another page on the same site opens in the reader. In terminals that support OSC 8, http, https and mailto links are clickable. Other schemes are shown as text only.
+
+## Images
+
+Images show up in the text as `[image: alt text] [4]`, numbered with the links. Typing the number and enter opens the image viewer, which draws the picture with half-block characters, two pixels to a cell. It looks like a thumbnail, not a photo, but it's enough to tell a diagram from a screenshot.
+
+kitty, Ghostty, WezTerm, Alacritty and foot set a `TERM` that tells sshr they have 24-bit color. Other terminals get the 256-color palette, or 16 colors when `TERM` is plain `xterm`, because SSH doesn't forward `COLORTERM` by default.
+
+sshr fetches images itself, so visitors' addresses never reach the image host. The fetches go through the same allowlist, robots.txt rules and rate limit as the site's pages, so images on a CDN need its host in `allowed_hosts`. sshr reads PNG, JPEG, GIF and WebP files up to 8 MB and 12 megapixels, checking the size from the file header before decoding. It doesn't read SVG. Decoded images are scaled to at most 512 pixels a side and cached in 32 MB shared by all sessions. Set `images = false` to turn the viewer off, and the number then shows the image's address like any other link.
 
 ## Security
 
@@ -91,7 +99,7 @@ Visitors are anonymous strangers, so sshr is built to give them nothing but the 
 - It only fetches from the site's own host and its `www.` variant, plus `allowed_hosts`. That means ports 80 and 443, or the port in the site URL, and redirects get the same check. Content can't point the fetcher at any host or port outside that list.
 - It follows each host's robots.txt, on redirects too. When robots.txt can't be fetched or answers with a server error, sshr fetches nothing from that host.
 - Connections and sessions are capped per client and in total. IPv6 clients count per /64. New sessions per client are rate limited, and a connection that doesn't open a session within 30 seconds is closed. Sessions end after an idle timeout and a maximum duration.
-- Visitors only ever read from the in-memory snapshot. Fetching happens in the background on a timer, so a flood of visitors never turns into requests to your site.
+- Visitors read pages from the in-memory snapshot, which is fetched in the background on a timer. The one fetch a visitor can cause is opening an image the site links to. Each image is fetched once an hour at most and then served from a shared cache, with at most four fetches at a time inside the site's rate limit. With `images = false`, a flood of visitors never turns into requests to your site.
 - Logs record IPs and session length, never key fingerprints.
 
 ## Resource use
@@ -104,6 +112,8 @@ These were measured on Linux with a small blog:
 | Docker image | 22 MB |
 | memory, idle | 29 MB |
 | memory, 50 open sessions | 95 MB |
+
+Images add up to 32 MB of cache. sshr decodes one image at a time, and a 12-megapixel image took peak memory from 26 MB to 80 MB.
 
 ## License
 
