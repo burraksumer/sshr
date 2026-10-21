@@ -23,6 +23,7 @@ import (
 	bm "charm.land/wish/v2/bubbletea"
 	"charm.land/wish/v2/ratelimiter"
 	"github.com/burraksumer/sshr/internal/content"
+	"github.com/burraksumer/sshr/internal/images"
 	"github.com/burraksumer/sshr/internal/ui"
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/pires/go-proxyproto"
@@ -44,6 +45,8 @@ type Config struct {
 	// TrustedProxies and reject every other sender.
 	ProxyProtocol  bool
 	TrustedProxies []string
+	// Images loads images for the viewer. Nil leaves them out.
+	Images *images.Loader
 }
 
 // Server is a running SSH server.
@@ -84,7 +87,7 @@ func New(cfg Config, store *content.Store, log *slog.Logger) (*Server, error) {
 		wish.WithMiddleware(
 			// Middleware runs bottom to top, so the last one listed runs first.
 			bm.Middleware(func(s ssh.Session) (tea.Model, []tea.ProgramOption) {
-				return ui.New(store), nil
+				return ui.New(store, cfg.Images), nil
 			}),
 			// Only sessions that passed every check below count as active.
 			markSession(),

@@ -503,3 +503,33 @@ func TestLargeErrorPageNotPermanent(t *testing.T) {
 		t.Errorf("got %v, %v; want a 503 response", res, err)
 	}
 }
+
+// Binary bodies arrive as sent, past the size limit for pages, and leave no
+// validators or redirects behind.
+func TestGetBinary(t *testing.T) {
+	body := "\x89PNG\r\n\x1a\n\xff\xfe" + strings.Repeat("\x00\x9b", 100)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/old.png":
+			http.Redirect(w, r, "/new.png", http.StatusMovedPermanently)
+		case "/new.png":
+			w.Header()["Content-Type"] = nil
+			w.Header().Set("ETag", `"x"`)
+			w.Write([]byte(body))
+		}
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	c := New(Options{Hosts: []string{u.Host}, Rate: 1000, Burst: 100, MaxBytes: 10})
+	old, _ := url.Parse(srv.URL + "/old.png")
+	res, err := c.GetBinary(context.Background(), old, "image/png", 1<<20)
+	if err != nil || string(res.Body) != body {
+		t.Fatalf("body = %q, %v", res.Body, err)
+	}
+	if len(c.validators) != 0 || len(c.moved) != 0 {
+		t.Errorf("validators %v, moved %v", c.validators, c.moved)
+	}
+	if _, err := c.GetBinary(context.Background(), old, "image/png", 100); !errors.Is(err, ErrPermanent) {
+		t.Errorf("over the limit: %v", err)
+	}
+}
