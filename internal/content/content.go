@@ -42,6 +42,8 @@ type Entry struct {
 	base string
 	// textKey identifies a text-only entry, which has no URL.
 	textKey string
+	// order is the entry's place in the manifest's page list, from 1, or 0.
+	order int
 }
 
 // renderID identifies an entry's content across refreshes.
@@ -81,6 +83,19 @@ type Site struct {
 	Title       string
 	Description string
 	Entries     []*Entry
+	// Logo is ASCII art to show above the title, without control
+	// characters. Accent is a "#rrggbb" color or "". Nav is the menu. All
+	// come from the site manifest and may be empty.
+	Logo   []string
+	Accent string
+	Nav    []Nav
+
+	// Manifest is whether the site publishes a manifest at ManifestPath.
+	Manifest bool
+
+	// remoteManifest is the manifest the site published, kept for a
+	// conditional request and reused when the fetch fails for a moment.
+	remoteManifest *Manifest
 
 	feedURL                    string
 	feedStale                  int // refreshes in a row the feed was unreadable
@@ -103,8 +118,18 @@ type Site struct {
 
 // Lookup returns the entry for rawURL, or nil if the site has none.
 func (s *Site) Lookup(rawURL string) *Entry {
-	if k, ok := key(rawURL); ok {
+	k, ok := key(rawURL)
+	if !ok {
+		return nil
+	}
+	if s.byURL != nil {
 		return s.byURL[k]
+	}
+	// A site built by hand has no index.
+	for _, e := range s.Entries {
+		if ek, ok := key(e.URL); ok && e.URL != "" && ek == k {
+			return e
+		}
 	}
 	return nil
 }

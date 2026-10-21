@@ -41,6 +41,9 @@ type Config struct {
 
 	// LogFormat is "json" or "text".
 	LogFormat string `toml:"log_format"`
+
+	// Site overrides the site's own manifest field by field.
+	Site content.Manifest `toml:"site"`
 }
 
 // Default returns the configuration used when a field is not set.

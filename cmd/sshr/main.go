@@ -153,6 +153,9 @@ func check(ctx context.Context, args []string) error {
 	}
 	site, _ := store.Site()
 	fmt.Printf("%s\n%s\n%d entries in %s\n\n", site.Title, site.Description, len(site.Entries), time.Since(start).Round(time.Millisecond))
+	if site.Manifest {
+		printManifest(site)
+	}
 	for _, e := range site.Entries {
 		kind := "post"
 		if e.Kind == content.Page {
@@ -167,13 +170,44 @@ func check(ctx context.Context, args []string) error {
 	return nil
 }
 
+// printManifest prints what the site's manifest set.
+func printManifest(site *content.Site) {
+	fmt.Println("manifest " + content.ManifestPath)
+	if len(site.Logo) > 0 {
+		fmt.Printf("  logo    %d lines\n", len(site.Logo))
+	}
+	if site.Accent != "" {
+		fmt.Println("  accent  " + site.Accent)
+	}
+	for i, n := range site.Nav {
+		var does string
+		switch n.Kind {
+		case content.NavAll:
+			does = "shows everything"
+		case content.NavPosts:
+			does = "shows posts"
+		case content.NavPages:
+			does = "shows pages"
+		case content.NavPage:
+			does = "opens " + n.URL
+			if site.Lookup(n.URL) == nil {
+				does += ", which sshr couldn't read"
+			}
+		case content.NavLink:
+			does = "links to " + n.URL
+		}
+		fmt.Printf("  %d %s  %s\n", i+1, n.Label, does)
+	}
+	fmt.Println()
+}
+
 func newStore(cfg config.Config, log *slog.Logger) (*content.Store, error) {
 	base, err := cfg.SiteURL()
 	if err != nil {
 		return nil, err
 	}
 	client := fetch.New(fetch.Options{Hosts: cfg.Hosts(base)})
-	disc := &content.Discoverer{Client: client, Base: base, MaxEntries: cfg.MaxEntries, PageBudget: cfg.PageBudget.D(), Log: log}
+	disc := &content.Discoverer{Client: client, Base: base, Manifest: &cfg.Site, MaxEntries: cfg.MaxEntries, PageBudget: cfg.PageBudget.D(), Log: log}
 	return content.NewStore(disc, log), nil
 }
 
