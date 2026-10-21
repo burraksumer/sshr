@@ -11,13 +11,17 @@ import (
 	"github.com/charmbracelet/x/ansi/kitty"
 )
 
-// The kitty graphics protocol shows real images in kitty and Ghostty. sshr
-// uses its Unicode placeholders: the image is sent once and placed
-// virtually, and the view draws placeholder characters where it goes. The
-// placeholders are text, so the TUI renderer moves and redraws them like any
-// other cell, and the terminal paints the image over them.
+// The kitty graphics protocol shows real images in terminals that support
+// it. sshr places an image one of two ways:
 //
-// See https://sw.kovidgoyal.net/kitty/graphics-protocol/#unicode-placeholders
+//   - With Unicode placeholders, in kitty and Ghostty: the image is placed
+//     virtually, and the view draws placeholder characters where it goes.
+//     The placeholders are text, so the TUI renderer moves and redraws them
+//     like any other cell, and the terminal paints the image over them.
+//   - Directly at a cell, in other terminals: the view leaves the cells
+//     blank, and the image is put there once the renderer has drawn them.
+//
+// See https://sw.kovidgoyal.net/kitty/graphics-protocol/
 
 // KittyQueryID is the image id of KittyQuery. A terminal that supports the
 // protocol answers it with "OK".
@@ -75,6 +79,29 @@ func KittyTransmit(id int, img *Image) string {
 // its earlier placement.
 func KittyPlace(id, cols, rows int) string {
 	return ansi.KittyGraphics(nil, "a=p", "U=1", "i="+strconv.Itoa(id), "p=1", "c="+strconv.Itoa(cols), "r="+strconv.Itoa(rows), "q=2")
+}
+
+// KittyPlaceAt places image id over cols by rows cells with its top left
+// corner at column x, row y, counted from 1, replacing its earlier placement.
+// The cursor is saved and restored around it, so the renderer's idea of
+// where the cursor is stays right.
+func KittyPlaceAt(id, cols, rows, x, y int) string {
+	return ansi.SaveCursor + ansi.CursorPosition(x, y) +
+		ansi.KittyGraphics(nil, "a=p", "i="+strconv.Itoa(id), "p=1", "c="+strconv.Itoa(cols), "r="+strconv.Itoa(rows), "C=1", "q=2") +
+		ansi.RestoreCursor
+}
+
+// KittyHide removes image id's placement and keeps its data, so it can be
+// placed again without sending it.
+func KittyHide(id int) string {
+	return ansi.KittyGraphics(nil, "a=d", "d=i", "i="+strconv.Itoa(id), "p=1", "q=2")
+}
+
+// KittyPlaceholders reports whether a terminal shows Unicode placeholders,
+// from its TERM and the name it reports to XTVERSION.
+func KittyPlaceholders(term, name string) bool {
+	name = strings.ToLower(name)
+	return term == "xterm-kitty" || term == "xterm-ghostty" || strings.HasPrefix(name, "kitty") || strings.HasPrefix(name, "ghostty")
 }
 
 // KittyDelete frees image id and its placements in the terminal.

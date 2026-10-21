@@ -264,44 +264,89 @@ func rawOf(t *testing.T, cmd tea.Cmd) string {
 	return ""
 }
 
-func TestKittyViewer(t *testing.T) {
+// kittyModel is a viewer model whose terminal answered the graphics query,
+// reading from a site with one 96 by 64 image.
+func kittyModel(t *testing.T, term, name string) (Model, func()) {
+	t.Helper()
 	var b bytes.Buffer
 	png.Encode(&b, image.NewRGBA(image.Rect(0, 0, 96, 64)))
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write(b.Bytes()) }))
-	defer srv.Close()
 	u, _ := url.Parse(srv.URL)
 	loader := images.New(fetch.New(fetch.Options{Hosts: []string{u.Host}, Rate: 1000, Burst: 100}))
 	m := Model{st: newStyles(true), width: 60, height: 20, vp: viewport.New(), images: loader, site: &content.Site{}}
 
-	// Only kitty and Ghostty are asked, and only an OK turns it on.
 	var tm tea.Model = m
-	if _, cmd := tm.Update(tea.EnvMsg{"TERM=xterm-256color"}); cmd != nil {
-		t.Error("asked a terminal without placeholders")
-	}
-	tm, cmd := tm.Update(tea.EnvMsg{"TERM=xterm-ghostty"})
-	if !strings.Contains(rawOf(t, cmd), "a=q") {
-		t.Error("no query")
-	}
+	tm, _ = tm.Update(tea.EnvMsg{"TERM=" + term})
+	tm, _ = tm.Update(tea.TerminalVersionMsg{Name: name})
 	tm, _ = tm.Update(uv.KittyGraphicsEvent{Options: kittyOpts(images.KittyQueryID), Payload: []byte("ENOTSUPPORTED")})
-	if tm.(Model).kitty {
+	if tm.(Model).kitty.on {
 		t.Error("kitty on after an error")
 	}
 	tm, _ = tm.Update(uv.KittyGraphicsEvent{Options: kittyOpts(images.KittyQueryID), Payload: []byte("OK")})
 	m = tm.(Model)
-	if !m.kitty {
+	if !m.kitty.on {
 		t.Fatal("kitty off after OK")
 	}
-
 	m.open(&content.Entry{URL: srv.URL + "/post", Body: "![cat](/cat.png)"}, false)
-	cmd = m.follow(1)
-	if m.picID != 16 {
-		t.Errorf("image id %d", m.picID)
+	return m, srv.Close
+}
+
+// openPic follows the image link and delivers the image and its encoding,
+// returning the command that sent the data.
+func openPic(t *testing.T, m Model) (Model, tea.Cmd) {
+	t.Helper()
+	var tm tea.Model = m
+	tm, _ = tm.Update(key("1"))
+	tm, cmd := tm.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	tm, cmd = tm.Update(cmd()) // the image
+	tm, cmd = tm.Update(cmd()) // its encoding
+	return tm.(Model), cmd
+}
+
+// cmds runs cmd and returns the messages it gives, looking inside batches.
+func cmds(cmd tea.Cmd) []tea.Msg {
+	if cmd == nil {
+		return nil
 	}
-	tm, cmd = m.Update(cmd())
+	msg := cmd()
+	if b, ok := msg.(tea.BatchMsg); ok {
+		var out []tea.Msg
+		for _, c := range b {
+			out = append(out, cmds(c)...)
+		}
+		return out
+	}
+	return []tea.Msg{msg}
+}
+
+func TestKittyInit(t *testing.T) {
+	m := Model{images: images.New(nil)}
+	var queried bool
+	for _, msg := range cmds(m.Init()) {
+		if r, ok := msg.(tea.RawMsg); ok && strings.Contains(fmt.Sprint(r.Msg), "a=q") {
+			queried = true
+		}
+	}
+	if !queried {
+		t.Error("no query at start")
+	}
+	if !images.KittyPlaceholders("xterm-256color", "kitty(0.39.1)") || !images.KittyPlaceholders("xterm-256color", "ghostty 1.2.0") || !images.KittyPlaceholders("xterm-ghostty", "") {
+		t.Error("kitty or Ghostty not recognized")
+	}
+	if images.KittyPlaceholders("xterm-256color", "WezTerm 20240203") {
+		t.Error("WezTerm taken for placeholders")
+	}
+}
+
+func TestKittyPlaceholders(t *testing.T) {
+	m, done := kittyModel(t, "xterm-256color", "ghostty 1.2.0")
+	defer done()
+	m, cmd := openPic(t, m)
+	if m.kitty.id != 16 || !m.kitty.virtual {
+		t.Errorf("id %d, virtual %v", m.kitty.id, m.kitty.virtual)
+	}
 	// The data goes out with a placement sized like the placeholders.
-	tm, place := tm.Update(cmd())
-	m = tm.(Model)
-	out := rawOf(t, place)
+	out := rawOf(t, cmd)
 	if !strings.Contains(out, "a=t,f=100,t=d,i=16") || !strings.HasSuffix(out, images.KittyPlace(16, 12, 4)) {
 		t.Errorf("transmission ends %q", out[max(len(out)-60, 0):])
 	}
@@ -309,10 +354,17 @@ func TestKittyViewer(t *testing.T) {
 		t.Errorf("viewer:\n%s", m.viewImage())
 	}
 	// A smaller window moves the image onto fewer cells.
-	tm, cmd = m.Update(tea.WindowSizeMsg{Width: 20, Height: 8})
+	var tm tea.Model = m
+	tm, cmd = tm.Update(tea.WindowSizeMsg{Width: 20, Height: 8})
 	if got := rawOf(t, cmd); got != images.KittyPlace(16, 6, 2) {
 		t.Errorf("resize sent %q", got)
 	}
+	// Help hides the placeholders, which hides the image, so nothing is sent.
+	tm, cmd = tm.Update(key("?"))
+	if cmd != nil {
+		t.Error("help sent something")
+	}
+	tm, _ = tm.Update(key("x"))
 	// Leaving frees it, and a late transmission for it is dropped.
 	tm, cmd = tm.Update(key("h"))
 	if got := rawOf(t, cmd); got != images.KittyDelete(16) {
@@ -324,8 +376,75 @@ func TestKittyViewer(t *testing.T) {
 	// The next image gets a new id.
 	m = tm.(Model)
 	m.follow(1)
-	if m.picID != 17 {
-		t.Errorf("next id %d", m.picID)
+	if m.kitty.id != 17 {
+		t.Errorf("next id %d", m.kitty.id)
+	}
+}
+
+// Terminals without placeholders, like WezTerm, get the image placed at a
+// cell once the renderer has drawn the blank space for it.
+func TestKittyDirect(t *testing.T) {
+	m, done := kittyModel(t, "xterm-256color", "WezTerm 20240203")
+	defer done()
+	m, cmd := openPic(t, m)
+	if m.kitty.virtual {
+		t.Fatal("placeholders for WezTerm")
+	}
+	if strings.Contains(m.viewImage(), "\U0010EEEE") || len(m.picLines) != 4 {
+		t.Errorf("viewer:\n%s", m.viewImage())
+	}
+	// The data goes out now, and the placement after placeDelay.
+	var data string
+	var tick placeTick
+	for _, msg := range cmds(cmd) {
+		switch v := msg.(type) {
+		case tea.RawMsg:
+			data = fmt.Sprint(v.Msg)
+		case placeTick:
+			tick = v
+		}
+	}
+	if !strings.Contains(data, "a=t,f=100") || strings.Contains(data, "a=p") {
+		t.Errorf("data %q", data[:min(len(data), 60)])
+	}
+	var tm tea.Model = m
+	tm, cmd = tm.Update(tick)
+	// 96 by 64 is 12 by 4 cells, centered in 58 columns, under 4 lines.
+	if got, want := rawOf(t, cmd), images.KittyPlaceAt(16, 12, 4, 25, 5); got != want {
+		t.Errorf("placed %q, want %q", got, want)
+	}
+	// An update that changes nothing sends nothing.
+	if _, cmd := tm.Update(renderedMsg{}); cmd != nil {
+		t.Error("an idle update sent kitty output")
+	}
+	// Help hides the image and keeps its data. Coming back places it again.
+	tm, cmd = tm.Update(key("?"))
+	if got := rawOf(t, cmd); got != images.KittyHide(16) {
+		t.Errorf("help sent %q", got)
+	}
+	tm, cmd = tm.Update(key("x"))
+	stale, ok := cmd().(placeTick)
+	if !ok {
+		t.Fatal("no placement after help")
+	}
+	// A resize before the tick replaces it with a newer one.
+	tm, cmd = tm.Update(tea.WindowSizeMsg{Width: 40, Height: 20})
+	if _, c := tm.Update(stale); c != nil {
+		t.Error("a stale tick placed the image")
+	}
+	var newest placeTick
+	for _, msg := range cmds(cmd) {
+		if p, ok := msg.(placeTick); ok {
+			newest = p
+		}
+	}
+	tm, cmd = tm.Update(newest)
+	if got, want := rawOf(t, cmd), images.KittyPlaceAt(16, 12, 4, 15, 5); got != want {
+		t.Errorf("after resize placed %q, want %q", got, want)
+	}
+	tm, cmd = tm.Update(key("h"))
+	if got := rawOf(t, cmd); got != images.KittyDelete(16) {
+		t.Errorf("leaving sent %q", got)
 	}
 }
 

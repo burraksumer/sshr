@@ -74,12 +74,7 @@ type Model struct {
 	picErr   error
 	picLines []string
 
-	// kitty graphics, for terminals that answered the query
-	kitty            bool
-	picID            int // the viewer's image in the terminal, or 0
-	lastID           int
-	picSent          bool // the image data went out
-	picCols, picRows int
+	kitty kittyState
 }
 
 // New returns a model that reads from store and loads images with loader,
@@ -140,6 +135,9 @@ func poll() tea.Cmd {
 }
 
 func (m Model) Init() tea.Cmd {
+	if m.images != nil {
+		return tea.Batch(tea.RequestBackgroundColor, poll(), kittyInit())
+	}
 	return tea.Batch(tea.RequestBackgroundColor, poll())
 }
 
@@ -194,14 +192,26 @@ func matches(e *content.Entry, q string) bool {
 	return false
 }
 
+// Update handles msg, then brings the terminal's image in line with the
+// screen.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	next, cmd := m.update(msg)
+	nm := next.(Model)
+	if sync := nm.kitty.sync(nm.screen == screenImage); sync != nil {
+		cmd = tea.Batch(cmd, sync)
+	}
+	return nm, cmd
+}
+
+func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.clampOffset()
-		place := m.drawPic()
+		m.kitty.resized()
+		m.drawPic()
 		if m.entry == nil {
-			return m, place
+			return m, nil
 		}
 		// Dragging a window edge sends many sizes. Resize the viewport now
 		// and render the text once the size settles, at the position the
@@ -213,7 +223,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.vp.SetHeight(max(m.height-1, 1))
 		m.resizeGen++
 		gen := m.resizeGen
-		return m, tea.Batch(place, tea.Tick(resizeSettle, func(time.Time) tea.Msg { return resizedMsg{gen} }))
+		return m, tea.Tick(resizeSettle, func(time.Time) tea.Msg { return resizedMsg{gen} })
 
 	case resizedMsg:
 		if msg.gen != m.resizeGen || m.entry == nil {
@@ -233,32 +243,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.screen == screenImage && msg.url == m.pic.URL && m.picImg == nil && m.picErr == nil {
 			m.picImg, m.picErr = msg.img, msg.err
 			m.drawPic()
-			if m.picID != 0 && m.picImg != nil {
-				id, img := m.picID, m.picImg
+			if m.kitty.id != 0 && m.picImg != nil {
+				id, img := m.kitty.id, m.picImg
 				return m, func() tea.Msg { return kittyDataMsg{id, images.KittyTransmit(id, img)} }
 			}
 		}
 		return m, nil
 
 	case kittyDataMsg:
-		// The viewer may have closed or moved on while the PNG was encoded.
-		if msg.id != m.picID || m.picSent || msg.data == "" {
-			return m, nil
-		}
-		m.picSent = true
-		return m, tea.Raw(msg.data + images.KittyPlace(m.picID, m.picCols, m.picRows))
+		return m, m.kitty.transmitted(msg, m.screen == screenImage)
+
+	case placeTick:
+		return m, m.kitty.place(msg, m.screen == screenImage)
 
 	case tea.EnvMsg:
-		// Only kitty and Ghostty are asked, since they show Unicode
-		// placeholders. Other terminals that answer the query may not.
-		if m.images != nil && kittyTerm(msg.Getenv("TERM")) {
-			return m, tea.Raw(images.KittyQuery)
-		}
+		m.kitty.term = msg.Getenv("TERM")
+		return m, nil
+
+	case tea.TerminalVersionMsg:
+		m.kitty.name = msg.Name
 		return m, nil
 
 	case uv.KittyGraphicsEvent:
 		if msg.Options.ID == images.KittyQueryID && string(msg.Payload) == "OK" {
-			m.kitty = true
+			m.kitty.on = true
 		}
 		return m, nil
 
@@ -290,6 +298,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch m.screen {
 		case screenHelp:
 			m.screen = m.prev
+			// The window may have changed size behind the help screen.
+			m.drawPic()
 			return m, nil
 		case screenReader:
 			return m.updateReader(msg)
@@ -490,33 +500,10 @@ type imageMsg struct {
 // going after that, so a later look may find it cached.
 const imageWait = 40 * time.Second
 
-// kittyDataMsg carries an encoded image for the terminal.
-type kittyDataMsg struct {
-	id   int
-	data string
-}
-
-// kittyTerm reports whether term names a terminal with Unicode placeholder
-// support.
-func kittyTerm(term string) bool {
-	return term == "xterm-kitty" || term == "xterm-ghostty"
-}
-
 // viewPic opens the image viewer on link and starts loading it.
 func (m *Model) viewPic(link render.Link) tea.Cmd {
 	m.screen, m.pic, m.picImg, m.picErr, m.picLines = screenImage, link, nil, nil, nil
-	m.picSent, m.picCols, m.picRows = false, 0, 0
-	if m.kitty {
-		// Ids start at 16, because the placeholders name the image with a
-		// 256-color index, and a renderer may rewrite 0 to 15 as basic
-		// colors. Each image gets a new id, so a late transmission can't
-		// land on the next image.
-		m.lastID++
-		if m.lastID < 16 || m.lastID > 255 {
-			m.lastID = 16
-		}
-		m.picID = m.lastID
-	}
+	m.kitty.open()
 	loader, u := m.images, link.URL
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), imageWait)
@@ -528,44 +515,35 @@ func (m *Model) viewPic(link render.Link) tea.Cmd {
 
 // closePic leaves the viewer's image, freeing it in the terminal.
 func (m *Model) closePic() tea.Cmd {
-	var cmd tea.Cmd
-	if m.picID != 0 {
-		cmd = tea.Raw(images.KittyDelete(m.picID))
-	}
-	m.picImg, m.picErr, m.picLines, m.picID, m.picSent = nil, nil, nil, 0, false
-	return cmd
+	m.picImg, m.picErr, m.picLines = nil, nil, nil
+	return m.kitty.close()
 }
 
-// drawPic draws the viewer's image for the current window size. With kitty
-// graphics it lays out placeholders, and returns the command that moves the
-// image onto them when their size changed.
-func (m *Model) drawPic() tea.Cmd {
+// drawPic lays out the viewer's image for the current window size: half
+// blocks, kitty placeholders, or blank cells for a direct kitty placement.
+func (m *Model) drawPic() {
 	if m.screen != screenImage || m.picImg == nil {
-		return nil
+		return
 	}
 	cols, rows := max(m.width-2, 1), max(m.height-picChrome, 1)
-	if m.picID != 0 {
+	if k := &m.kitty; k.id != 0 {
 		c, r := images.KittySize(m.picImg, cols, rows)
-		pad := strings.Repeat(" ", (cols-c)/2)
-		m.picLines = images.KittyCells(m.picID, c, r)
-		for i := range m.picLines {
-			m.picLines[i] = pad + m.picLines[i]
+		pad := (cols - c) / 2
+		// The view's margin is one column, and columns count from 1.
+		k.cols, k.rows, k.x = c, r, 2+pad
+		m.picLines = make([]string, r)
+		if k.virtual {
+			for i, l := range images.KittyCells(k.id, c, r) {
+				m.picLines[i] = strings.Repeat(" ", pad) + l
+			}
 		}
-		if c == m.picCols && r == m.picRows {
-			return nil
-		}
-		m.picCols, m.picRows = c, r
-		if m.picSent {
-			return tea.Raw(images.KittyPlace(m.picID, c, r))
-		}
-		return nil
+		return
 	}
 	bg := color.RGBA{0, 0, 0, 255}
 	if !m.dark {
 		bg = color.RGBA{255, 255, 255, 255}
 	}
 	m.picLines = images.Draw(m.picImg, cols, rows, bg)
-	return nil
 }
 
 // picChrome is the number of lines around the image in the viewer: a blank
