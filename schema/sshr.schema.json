@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/burraksumer/sshr/blob/main/schema/sshr.schema.json",
+  "title": "sshr site manifest",
+  "description": "Published at /.well-known/sshr.json. Every field is optional, and sshr ignores fields it doesn't know.",
+  "type": "object",
+  "properties": {
+    "title": {
+      "type": "string",
+      "maxLength": 200,
+      "description": "Replaces the title from the homepage or feed."
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 300,
+      "description": "Replaces the description from the homepage or feed."
+    },
+    "logo": {
+      "type": "string",
+      "description": "ASCII art shown above the title when the terminal is tall and wide enough. sshr keeps the first 16 lines and the first 100 characters of each, and strips control characters."
+    },
+    "accent": {
+      "type": "string",
+      "pattern": "^#[0-9a-fA-F]{6}$",
+      "description": "Color for the title, keys and selection."
+    },
+    "feed": {
+      "type": "string",
+      "description": "Feed URL, absolute or relative to the site. sshr tries it before the feeds the homepage links."
+    },
+    "pages": {
+      "type": "array",
+      "maxItems": 50,
+      "items": { "type": "string" },
+      "description": "Pages to include, like /about. They come first among pages, in this order."
+    },
+    "exclude": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^/" },
+      "description": "Path prefixes, like /tags/, whose entries are left out."
+    },
+    "sitemap": {
+      "type": "boolean",
+      "default": true,
+      "description": "Set to false to stop sshr from adding pages from the sitemap."
+    },
+    "nav": {
+      "type": "array",
+      "maxItems": 9,
+      "description": "The menu. Visitors pick items with the number keys 1 to 9.",
+      "items": {
+        "type": "object",
+        "required": ["label"],
+        "properties": {
+          "label": { "type": "string", "maxLength": 40 },
+          "show": {
+            "enum": ["all", "posts", "pages"],
+            "description": "Filters the list."
+          },
+          "page": {
+            "type": "string",
+            "description": "Opens this page of the site in the reader. sshr includes it even when pages doesn't list it."
+          },
+          "url": {
+            "type": "string",
+            "description": "An http, https or mailto link, shown in the footer for the visitor to open."
+          }
+        },
+        "oneOf": [
+          { "required": ["show"] },
+          { "required": ["page"] },
+          { "required": ["url"] }
+        ]
+      }
+    }
+  }
+}

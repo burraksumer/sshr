@@ -60,6 +60,11 @@ type Model struct {
 	digits     string
 	history    []visit
 	status     string
+
+	// The site manifest's menu and accent.
+	view   content.NavKind // which entries the list shows
+	navSel int             // the menu item showing, or -1
+	accent string
 }
 
 // New returns a model that reads from store.
@@ -71,7 +76,7 @@ func New(store *content.Store) Model {
 	// is the server. Terminal paste still works through bracketed paste.
 	ti.KeyMap.Paste.SetEnabled(false)
 	m := Model{store: store, dark: true, width: 80, height: 24, filter: ti, renders: rate.NewLimiter(2, 3)}
-	m.st = newStyles(m.dark)
+	m.st = newStyles(m.dark, "")
 	m.vp = viewport.New()
 	m.syncSite()
 	return m
@@ -134,7 +139,13 @@ func (m *Model) syncSite() {
 	if m.cursor < len(m.visible) {
 		selected = m.visible[m.cursor].Key()
 	}
+	first := m.site == nil
 	m.site = site
+	if site.Accent != m.accent {
+		m.accent = site.Accent
+		m.st = newStyles(m.dark, m.accent)
+	}
+	m.pickView(first)
 	m.applyFilter()
 	for i, e := range m.visible {
 		if selected != "" && e.Key() == selected {
@@ -153,6 +164,9 @@ func (m *Model) applyFilter() {
 	q := strings.ToLower(strings.TrimSpace(m.filter.Value()))
 	m.visible = m.visible[:0]
 	for _, e := range m.site.Entries {
+		if m.view == content.NavPosts && e.Kind != content.Post || m.view == content.NavPages && e.Kind != content.Page {
+			continue
+		}
 		if q == "" || matches(e, q) {
 			m.visible = append(m.visible, e)
 		}
@@ -216,7 +230,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.BackgroundColorMsg:
 		if dark := msg.IsDark(); dark != m.dark {
 			m.dark = dark
-			m.st = newStyles(dark)
+			m.st = newStyles(dark, m.accent)
 			if m.entry != nil {
 				return m, m.renderEntry(m.position())
 			}
@@ -286,6 +300,15 @@ func (m Model) updateList(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		return m, nil
+	}
+	if !m.filtering {
+		m.status = ""
+		// The number keys pick menu items.
+		if len(k) == 1 && k[0] >= '1' && k[0] <= '9' {
+			if i := int(k[0] - '1'); i < len(m.site.Nav) {
+				return m, m.pick(i)
+			}
+		}
 	}
 	if m.filtering {
 		switch k {
@@ -557,7 +580,77 @@ func (m Model) headerHeight() int {
 	if m.site != nil && m.site.Description != "" {
 		h++
 	}
+	if m.showLogo() {
+		h += len(m.site.Logo) + 1
+	}
+	if m.site != nil && len(m.site.Nav) > 0 {
+		h++
+	}
 	return h
+}
+
+// showLogo reports whether the manifest's logo fits above the list with
+// room left for entries.
+func (m Model) showLogo() bool {
+	if m.site == nil || len(m.site.Logo) == 0 || m.height < len(m.site.Logo)+14 {
+		return false
+	}
+	for _, l := range m.site.Logo {
+		if ansi.StringWidth(l)+2 > m.width {
+			return false
+		}
+	}
+	return true
+}
+
+// pickView keeps the list's filter in step with the site's menu. The list
+// starts on the menu's first list item, like Posts. After a refresh changes
+// the menu, it stays on the same filter if the menu still offers it.
+func (m *Model) pickView(first bool) {
+	nav := m.site.Nav
+	if !first {
+		if m.navSel >= 0 && m.navSel < len(nav) && nav[m.navSel].Kind == m.view {
+			return
+		}
+		for i, n := range nav {
+			if n.Kind == m.view {
+				m.navSel = i
+				return
+			}
+		}
+		if m.view == content.NavAll {
+			m.navSel = -1
+			return
+		}
+	}
+	m.view, m.navSel = content.NavAll, -1
+	for i, n := range nav {
+		if n.Kind <= content.NavPages {
+			m.view, m.navSel = n.Kind, i
+			return
+		}
+	}
+}
+
+// pick runs menu item i: it filters the list, opens a page or shows a link.
+func (m *Model) pick(i int) tea.Cmd {
+	n := m.site.Nav[i]
+	switch n.Kind {
+	case content.NavAll, content.NavPosts, content.NavPages:
+		m.view, m.navSel, m.cursor, m.offset = n.Kind, i, 0, 0
+		m.applyFilter()
+	case content.NavPage:
+		if e := m.site.Lookup(n.URL); e != nil {
+			return m.open(e, false)
+		}
+		m.status = n.Label + " isn't available yet."
+	case content.NavLink:
+		m.status = n.Label + " " + n.URL
+		if render.Clickable(n.URL) {
+			m.status = n.Label + " " + ansi.SetHyperlink(n.URL) + n.URL + ansi.ResetHyperlink()
+		}
+	}
+	return nil
 }
 
 func (m Model) listHeight() int {
@@ -615,15 +708,29 @@ func (m Model) viewLoading() string {
 func (m Model) viewList() string {
 	w := m.width
 	var b strings.Builder
-	b.WriteString("\n " + m.st.title.Render(ansi.Truncate(m.site.Title, max(w-2, 1), "…")) + "\n")
+	b.WriteString("\n")
+	if m.showLogo() {
+		for _, l := range m.site.Logo {
+			b.WriteString(" " + m.st.accent.Render(l) + "\n")
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString(" " + m.st.title.Render(ansi.Truncate(m.site.Title, max(w-2, 1), "…")) + "\n")
 	if m.site.Description != "" {
 		b.WriteString(" " + m.st.dim.Render(ansi.Truncate(m.site.Description, max(w-2, 1), "…")) + "\n")
+	}
+	if len(m.site.Nav) > 0 {
+		b.WriteString(" " + ansi.Truncate(m.menu(), max(w-2, 1), "…") + "\n")
 	}
 	b.WriteString("\n")
 
 	h := m.listHeight()
 	rightW := 12
 	for i := m.offset; i < m.offset+h; i++ {
+		if i == 0 && len(m.visible) == 0 {
+			b.WriteString("  " + m.st.dim.Render(m.emptyList()) + "\n")
+			continue
+		}
 		if i >= len(m.visible) {
 			b.WriteString("\n")
 			continue
@@ -649,14 +756,48 @@ func (m Model) viewList() string {
 
 	b.WriteString("\n")
 	switch {
+	case m.status != "":
+		b.WriteString(" " + m.status)
 	case m.filtering:
 		b.WriteString(" " + m.filter.View())
 	case m.filter.Value() != "":
 		b.WriteString(" " + m.st.accent.Render("/"+m.filter.Value()) + m.st.dim.Render(fmt.Sprintf("  %d of %d · esc clear", len(m.visible), len(m.site.Entries))))
 	default:
-		b.WriteString(" " + m.footer("↑↓/jk move", "enter read", "/ search", "? help", "q quit"))
+		if len(m.site.Nav) > 0 {
+			b.WriteString(" " + m.footer("↑↓/jk move", "enter read", fmt.Sprintf("1-%d menu", len(m.site.Nav)), "/ search", "? help", "q quit"))
+		} else {
+			b.WriteString(" " + m.footer("↑↓/jk move", "enter read", "/ search", "? help", "q quit"))
+		}
 	}
 	return b.String()
+}
+
+// emptyList says why the list has no rows.
+func (m Model) emptyList() string {
+	switch {
+	case m.filter.Value() != "":
+		return "No matches."
+	case m.view == content.NavPosts:
+		return "No posts yet."
+	case m.view == content.NavPages:
+		return "No pages yet."
+	}
+	return "Nothing here yet."
+}
+
+// menu is the manifest's menu as one line, with the list item showing
+// highlighted.
+func (m Model) menu() string {
+	parts := make([]string, len(m.site.Nav))
+	for i, n := range m.site.Nav {
+		item := fmt.Sprintf("%d %s", i+1, n.Label)
+		if i == m.navSel {
+			parts[i] = m.st.selected.Render(" " + item + " ")
+		} else {
+			parts[i] = " " + m.st.key.Render(fmt.Sprint(i+1)) + " " + n.Label + " "
+		}
+	}
+	return strings.Join(parts, "")
 }
 
 func (m Model) viewReader() string {
@@ -694,6 +835,7 @@ func (m Model) viewHelp() string {
 		{"g  G", "first, last"},
 		{"/", "search titles, summaries and tags"},
 		{"esc", "clear search"},
+		{"1-9", "menu items, when the site has a menu"},
 		{"", ""},
 		{"", "Reader"},
 		{"↑ ↓  j k", "scroll"},

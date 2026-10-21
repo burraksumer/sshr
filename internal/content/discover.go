@@ -111,6 +111,9 @@ func inScope(u *url.URL, scope string) bool {
 type Discoverer struct {
 	Client *fetch.Client
 	Base   *url.URL
+	// Manifest holds the operator's [site] settings, which win over the
+	// manifest the site publishes. It may be nil.
+	Manifest *Manifest
 	// PageBudget bounds how long one refresh spends fetching pages.
 	PageBudget time.Duration
 	// MaxEntries caps how many documents a site may have.
@@ -156,6 +159,9 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 	}
 
 	site = &Site{URL: d.Base.String(), Title: d.Base.Hostname(), robotsSitemaps: sitemaps}
+	site.remoteManifest = d.loadManifest(ctx, prev, log)
+	site.Manifest = site.remoteManifest != nil
+	man := merge(d.Manifest, site.remoteManifest).check(d.Base)
 	var feedLinks []feedLink
 	// The homepage is asked for conditionally, and its head is reused when
 	// it hasn't changed.
@@ -192,8 +198,10 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 	}
 
 	// Feeds give posts with dates and, often, full content.
-	entries, feedURL := d.loadFeed(ctx, site, feedLinks, prev, scope, log)
+	entries, feedURL := d.loadFeed(ctx, site, feedLinks, man.feed, prev, scope, log)
 	site.feedURL = feedURL
+	entries = slices.DeleteFunc(entries, func(e *Entry) bool { return man.excludes(e.URL) })
+	man.apply(site)
 	// Some feeds list oldest first. Keep the newest posts when cutting.
 	sort.SliceStable(entries, func(i, j int) bool {
 		a, b := entries[i].Date, entries[j].Date
@@ -235,7 +243,19 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 			seen[k] = true
 		}
 	}
-	if room := maxEntries - len(entries); room > 0 {
+	// Pages the manifest lists come before the sitemap's, in its order.
+	for i, raw := range man.pages {
+		k, ok := key(raw)
+		if !ok || seen[k] || len(entries) >= maxEntries {
+			continue
+		}
+		if u, err := url.Parse(raw); err != nil || !inScope(u, scope) || !d.Client.MayFetch(ctx, u) {
+			continue
+		}
+		seen[k] = true
+		entries = append(entries, &Entry{URL: raw, Kind: Page, order: i + 1})
+	}
+	if room := maxEntries - len(entries); room > 0 && man.sitemap {
 		pages, cache := d.loadSitemaps(ctx, sitemaps, prev, scope, log)
 		site.sitemaps = cache
 		for _, p := range pages {
@@ -249,7 +269,7 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 				continue
 			}
 			key := normalize(loc)
-			if seen[key] || !d.Client.MayFetch(ctx, p.loc) {
+			if seen[key] || man.excluded(loc) || !d.Client.MayFetch(ctx, p.loc) {
 				continue
 			}
 			seen[key] = true
@@ -273,6 +293,7 @@ func (d *Discoverer) Discover(ctx context.Context, prev *Site, publish func(*Sit
 		d.Client.Keep(raw)
 	}
 	d.Client.Keep(site.feedURL)
+	d.Client.Keep(d.Base.ResolveReference(&url.URL{Path: ManifestPath}).String())
 
 	var kept []*Entry
 	for _, e := range entries {
@@ -324,6 +345,13 @@ func finish(site *Site, kept []*Entry) *Site {
 			return a.Date.After(b.Date)
 		}
 		if a.Kind == Page {
+			// Pages the manifest lists come first, in its order.
+			if (a.order > 0) != (b.order > 0) {
+				return a.order > 0
+			}
+			if a.order > 0 {
+				return a.order < b.order
+			}
 			return strings.ToLower(a.Title) < strings.ToLower(b.Title)
 		}
 		return false
@@ -335,10 +363,13 @@ func finish(site *Site, kept []*Entry) *Site {
 
 // loadFeed tries feed candidates in order and returns the entries of the first
 // one that parses with at least one item.
-func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []feedLink, prev *Site, scope string, log *slog.Logger) ([]*Entry, string) {
-	// Advertised feeds first, then the common paths, in case the advertised
-	// ones are broken.
+func (d *Discoverer) loadFeed(ctx context.Context, site *Site, links []feedLink, preferred string, prev *Site, scope string, log *slog.Logger) ([]*Entry, string) {
+	// The manifest's feed first, then advertised feeds, then the common
+	// paths, in case the advertised ones are broken.
 	candidates := sortFeeds(links)
+	if preferred != "" {
+		candidates = append([]string{preferred}, slices.DeleteFunc(candidates, func(c string) bool { return c == preferred })...)
+	}
 	// The feed that worked last time is tried even when the homepage
 	// couldn't be read this round, but after any feeds the homepage
 	// advertises, which may have become better.
@@ -821,7 +852,10 @@ func applyPublished(e *Entry, t time.Time) {
 	if e.Date.IsZero() || !e.fromFeed {
 		e.Date = t
 	}
-	e.Kind = Post
+	// A page the manifest lists stays a page.
+	if e.order == 0 {
+		e.Kind = Post
+	}
 }
 
 // reuse copies old's page content into e, keeping the feed's own fields.
