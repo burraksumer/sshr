@@ -21,7 +21,7 @@ The site doesn't need any changes. sshr reads what it already publishes:
 3. the sitemap, for pages the feed doesn't list
 4. each page that the feed only summarizes. sshr asks for `text/markdown` first, and when the site sends HTML it extracts the article with Readability
 
-A site URL with a path, like `https://example.com/blog`, limits sshr to that part of the site.
+A site URL with a path, like `https://example.com/blog`, limits sshr to that part of the site. A site that wants more say in how it looks can publish a [manifest](#site-manifest).
 
 ## Run it
 
@@ -64,6 +64,42 @@ Everything except the URL has a default. See [`sshr.example.toml`](sshr.example.
 
 sshr reads `sshr.toml` from the working directory if it exists. A file named with `--config` or `SSHR_CONFIG` must exist. In Docker the working directory is `/data`, so mount the file at `/data/sshr.toml`. `SSHR_URL`, `SSHR_LISTEN`, `SSHR_HOST_KEY` and `SSHR_LOG_FORMAT` override the file, and `--url` and `--listen` override both. Set `SSHR_DEBUG=1` to also log fetches that fail.
 
+## Site manifest
+
+A site can publish `/.well-known/sshr.json` to set its menu, logo and color, and to pick which pages sshr shows. Every field is optional. [`schema/sshr.schema.json`](schema/sshr.schema.json) describes the format, and editors that read JSON Schema will check the file if it starts with `"$schema": "https://raw.githubusercontent.com/burraksumer/sshr/main/schema/sshr.schema.json"`.
+
+```json
+{
+  "title": "Example",
+  "description": "Notes and posts.",
+  "accent": "#e8590c",
+  "logo": " _____\n| ____|_  __\n|  _| \\ \\/ /\n| |___ >  <\n|_____/_/\\_\\",
+  "feed": "/feed.xml",
+  "pages": ["/about", "/now"],
+  "exclude": ["/tags/", "/drafts/"],
+  "sitemap": false,
+  "nav": [
+    { "label": "Posts", "show": "posts" },
+    { "label": "Pages", "show": "pages" },
+    { "label": "About", "page": "/about" },
+    { "label": "GitHub", "url": "https://github.com/example" }
+  ]
+}
+```
+
+- `title` and `description` replace what sshr reads from the homepage and feed.
+- `logo` is ASCII art above the title. sshr shows it only when the terminal has room for it above the list, keeps up to 16 lines of 100 characters, and strips control characters.
+- `accent` is a `#rrggbb` color for the title, keys and selection.
+- `feed` is tried before the feeds the homepage links.
+- `pages` are included even when the sitemap doesn't list them, and come first among pages in this order.
+- `exclude` drops posts and pages whose path starts with one of these prefixes.
+- `sitemap: false` stops sshr from adding pages from the sitemap, so only the feed, `pages` and menu pages are listed.
+- `nav` is a menu of up to nine items, picked with the number keys. An item with `show` filters the list to `all`, `posts` or `pages`, and the list starts on the first one. An item with `page` opens that page, which sshr includes without it being listed in `pages`. An item with `url` shows the link in the footer.
+
+sshr fetches the manifest on every refresh, with the same robots.txt rules and allowed hosts as the rest of the site. When the fetch fails for a moment it keeps the last copy. A manifest over 64 KiB or one that isn't valid JSON counts as missing.
+
+The `[site]` section of `sshr.toml` takes the same fields and wins over the site's manifest field by field. That's also how to set a menu for a site you don't control.
+
 ## Keys
 
 | List | |
@@ -72,6 +108,7 @@ sshr reads `sshr.toml` from the working directory if it exists. A file named wit
 | `enter` `l` | read |
 | `/` | search titles, summaries and tags |
 | `g` `G` | first, last |
+| `1` to `9` | menu items, when the site has a menu |
 
 | Reader | |
 |---|---|

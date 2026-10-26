@@ -10,9 +10,14 @@ type styles struct {
 	title, dim, accent, selected, key, err lipgloss.Style
 }
 
-func newStyles(dark bool) styles {
+// newStyles builds the styles for a dark or light terminal. siteAccent is a
+// "#rrggbb" color from the site manifest, or "" for the default.
+func newStyles(dark bool, siteAccent string) styles {
 	ld := lipgloss.LightDark(dark)
 	accent := ld(lipgloss.Color("#3b5bdb"), lipgloss.Color("#8caaee"))
+	if siteAccent != "" {
+		accent = lipgloss.Color(siteAccent)
+	}
 	dim := ld(lipgloss.Color("#868e96"), lipgloss.Color("#737994"))
 	var selFg color.Color = ld(lipgloss.Color("#ffffff"), lipgloss.Color("#232634"))
 	return styles{

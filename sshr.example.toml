@@ -35,3 +35,34 @@ url = "https://example.com"
 # Let visitors view the site's images. sshr fetches them from the same hosts
 # as its pages.
 # images = true
+
+# Overrides for the site's manifest at /.well-known/sshr.json, field by field.
+# The README's "Site manifest" section explains each field. A site you don't
+# control can be set up the same way from here.
+# [site]
+# title = "Example"
+# description = "Notes and posts."
+# accent = "#e8590c"
+# logo = '''
+#  _____
+# | ____|_  __
+# |  _| \ \/ /
+# | |___ >  <
+# |_____/_/\_\
+# '''
+# feed = "/feed.xml"
+# pages = ["/about", "/now"]
+# exclude = ["/tags/", "/drafts/"]
+# sitemap = false
+#
+# [[site.nav]]
+# label = "Posts"
+# show = "posts"
+#
+# [[site.nav]]
+# label = "About"
+# page = "/about"
+#
+# [[site.nav]]
+# label = "GitHub"
+# url = "https://github.com/example"

@@ -45,6 +45,9 @@ type Config struct {
 	// Images lets visitors view the site's images, which sshr fetches
 	// from the same hosts as its pages.
 	Images bool `toml:"images"`
+
+	// Site overrides the site's own manifest field by field.
+	Site content.Manifest `toml:"site"`
 }
 
 // Default returns the configuration used when a field is not set.
