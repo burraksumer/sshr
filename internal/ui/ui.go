@@ -1,10 +1,12 @@
 // Package ui is the terminal reader. It has a list of everything on the site, a
-// reader for one entry, and a help screen. The same model runs over SSH and
+// reader for one entry, an image viewer and a help screen. The same model runs over SSH and
 // in a local terminal.
 package ui
 
 import (
+	"context"
 	"fmt"
+	"image/color"
 	"strconv"
 	"strings"
 	"time"
@@ -13,7 +15,10 @@ import (
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"github.com/burraksumer/sshr/internal/content"
+	"github.com/burraksumer/sshr/internal/images"
 	"github.com/burraksumer/sshr/internal/render"
+	"github.com/burraksumer/sshr/internal/sanitize"
+	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/charmbracelet/x/ansi"
 	"golang.org/x/time/rate"
 )
@@ -27,6 +32,7 @@ const (
 	screenList screen = iota
 	screenReader
 	screenHelp
+	screenImage
 )
 
 // Model is the Bubble Tea model for one visitor.
@@ -65,17 +71,27 @@ type Model struct {
 	view   content.NavKind // which entries the list shows
 	navSel int             // the menu item showing, or -1
 	accent string
+
+	// image viewer
+	images   *images.Loader // nil when images are off
+	pic      render.Link
+	picImg   *images.Image
+	picErr   error
+	picLines []string
+
+	kitty kittyState
 }
 
-// New returns a model that reads from store.
-func New(store *content.Store) Model {
+// New returns a model that reads from store and loads images with loader,
+// which may be nil to leave images out.
+func New(store *content.Store, loader *images.Loader) Model {
 	ti := textinput.New()
 	ti.Prompt = "/"
 	ti.Placeholder = "search titles, summaries and tags"
 	// ctrl+v reads the clipboard of the machine sshr runs on, which over SSH
 	// is the server. Terminal paste still works through bracketed paste.
 	ti.KeyMap.Paste.SetEnabled(false)
-	m := Model{store: store, dark: true, width: 80, height: 24, filter: ti, renders: rate.NewLimiter(2, 3)}
+	m := Model{store: store, images: loader, dark: true, width: 80, height: 24, filter: ti, renders: rate.NewLimiter(2, 3)}
 	m.st = newStyles(m.dark, "")
 	m.vp = viewport.New()
 	m.syncSite()
@@ -124,6 +140,9 @@ func poll() tea.Cmd {
 }
 
 func (m Model) Init() tea.Cmd {
+	if m.images != nil {
+		return tea.Batch(tea.RequestBackgroundColor, poll(), kittyInit())
+	}
 	return tea.Batch(tea.RequestBackgroundColor, poll())
 }
 
@@ -187,11 +206,24 @@ func matches(e *content.Entry, q string) bool {
 	return false
 }
 
+// Update handles msg, then brings the terminal's image in line with the
+// screen.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	next, cmd := m.update(msg)
+	nm := next.(Model)
+	if sync := nm.kitty.sync(nm.screen == screenImage); sync != nil {
+		cmd = tea.Batch(cmd, sync)
+	}
+	return nm, cmd
+}
+
+func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.clampOffset()
+		m.kitty.resized()
+		m.drawPic()
 		if m.entry == nil {
 			return m, nil
 		}
@@ -221,6 +253,37 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.resizing = false
 		return m, m.renderEntry(pos)
 
+	case imageMsg:
+		if m.screen == screenImage && msg.url == m.pic.URL && m.picImg == nil && m.picErr == nil {
+			m.picImg, m.picErr = msg.img, msg.err
+			m.drawPic()
+			if m.kitty.id != 0 && m.picImg != nil {
+				id, img := m.kitty.id, m.picImg
+				return m, func() tea.Msg { return kittyDataMsg{id, images.KittyTransmit(id, img)} }
+			}
+		}
+		return m, nil
+
+	case kittyDataMsg:
+		return m, m.kitty.transmitted(msg, m.screen == screenImage)
+
+	case placeTick:
+		return m, m.kitty.place(msg, m.screen == screenImage)
+
+	case tea.EnvMsg:
+		m.kitty.term = msg.Getenv("TERM")
+		return m, nil
+
+	case tea.TerminalVersionMsg:
+		m.kitty.name = msg.Name
+		return m, nil
+
+	case uv.KittyGraphicsEvent:
+		if msg.Options.ID == images.KittyQueryID && string(msg.Payload) == "OK" {
+			m.kitty.on = true
+		}
+		return m, nil
+
 	case renderedMsg:
 		if m.entry != nil && msg.key == m.currentKey() {
 			m.show(msg.doc, msg.pos)
@@ -231,6 +294,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if dark := msg.IsDark(); dark != m.dark {
 			m.dark = dark
 			m.st = newStyles(dark, m.accent)
+			m.drawPic()
 			if m.entry != nil {
 				return m, m.renderEntry(m.position())
 			}
@@ -243,14 +307,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyPressMsg:
 		if msg.String() == "ctrl+c" {
-			return m, tea.Quit
+			return m, tea.Sequence(m.closePic(), tea.Quit)
 		}
 		switch m.screen {
 		case screenHelp:
 			m.screen = m.prev
+			// The window may have changed size behind the help screen.
+			m.drawPic()
 			return m, nil
 		case screenReader:
 			return m.updateReader(msg)
+		case screenImage:
+			switch msg.String() {
+			case "esc", "q", "h", "left", "backspace":
+				cmd := m.closePic()
+				m.screen = screenReader
+				return m, cmd
+			case "?":
+				m.prev, m.screen = m.screen, screenHelp
+			}
+			return m, nil
 		default:
 			return m.updateList(msg)
 		}
@@ -423,6 +499,9 @@ func (m *Model) follow(n int) tea.Cmd {
 		return nil
 	}
 	link := m.doc.Links[n-1]
+	if link.Image && m.images != nil {
+		return m.viewPic(link)
+	}
 	if e := m.site.Lookup(link.URL); e != nil {
 		return m.open(e, true)
 	}
@@ -432,6 +511,68 @@ func (m *Model) follow(n int) tea.Cmd {
 	}
 	return nil
 }
+
+// imageMsg brings back an image loaded off the event loop.
+type imageMsg struct {
+	url string
+	img *images.Image
+	err error
+}
+
+// imageWait is how long the viewer waits for an image. The loader keeps
+// going after that, so a later look may find it cached.
+const imageWait = 40 * time.Second
+
+// viewPic opens the image viewer on link and starts loading it.
+func (m *Model) viewPic(link render.Link) tea.Cmd {
+	m.screen, m.pic, m.picImg, m.picErr, m.picLines = screenImage, link, nil, nil, nil
+	m.kitty.open()
+	loader, u := m.images, link.URL
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), imageWait)
+		defer cancel()
+		img, err := loader.Load(ctx, u)
+		return imageMsg{u, img, err}
+	}
+}
+
+// closePic leaves the viewer's image, freeing it in the terminal.
+func (m *Model) closePic() tea.Cmd {
+	m.picImg, m.picErr, m.picLines = nil, nil, nil
+	return m.kitty.close()
+}
+
+// drawPic lays out the viewer's image for the current window size: half
+// blocks, kitty placeholders, or blank cells for a direct kitty placement.
+func (m *Model) drawPic() {
+	if m.screen != screenImage || m.picImg == nil {
+		return
+	}
+	cols, rows := max(m.width-2, 1), max(m.height-picChrome, 1)
+	if k := &m.kitty; k.id != 0 {
+		c, r := images.KittySize(m.picImg, cols, rows)
+		pad := (cols - c) / 2
+		// The view's margin is one column, and columns count from 1.
+		k.cols, k.rows, k.x = c, r, 2+pad
+		m.picLines = make([]string, r)
+		if k.virtual {
+			for i, l := range images.KittyCells(k.id, c, r) {
+				m.picLines[i] = strings.Repeat(" ", pad) + l
+			}
+		}
+		return
+	}
+	bg := color.RGBA{0, 0, 0, 255}
+	if !m.dark {
+		bg = color.RGBA{255, 255, 255, 255}
+	}
+	m.picLines = images.Draw(m.picImg, cols, rows, bg)
+}
+
+// picChrome is the number of lines around the image in the viewer: a blank
+// line, the title, the URL and a blank line above it, and a blank line and
+// the footer below.
+const picChrome = 6
 
 // leave forgets a resize in progress, so its position isn't applied to
 // the next entry or kept after going back to the list.
@@ -685,6 +826,8 @@ func (m Model) View() tea.View {
 		s = m.viewHelp()
 	case m.screen == screenReader:
 		s = m.viewReader()
+	case m.screen == screenImage:
+		s = m.viewImage()
 	default:
 		s = m.viewList()
 	}
@@ -818,6 +961,40 @@ func (m Model) viewReader() string {
 	return m.vp.View() + "\n " + left + strings.Repeat(" ", gap) + right
 }
 
+func (m Model) viewImage() string {
+	w := max(m.width-2, 1)
+	title := m.pic.Alt
+	if title == "" {
+		title = "Image"
+	}
+	link := ansi.Truncate(m.pic.URL, w, "…")
+	if render.Clickable(m.pic.URL) {
+		link = ansi.SetHyperlink(m.pic.URL) + link + ansi.ResetHyperlink()
+	}
+	var b strings.Builder
+	b.WriteString("\n " + m.st.title.Render(ansi.Truncate(title, w, "…")) + "\n " + m.st.dim.Render(link) + "\n\n")
+	body := m.picLines
+	switch {
+	case m.picErr != nil:
+		body = []string{m.st.err.Render(ansi.Truncate("Couldn't load the image: "+sanitize.Line(m.picErr.Error()), w, "…"))}
+	case m.picImg == nil:
+		body = []string{m.st.dim.Render("Loading the image…")}
+	}
+	rows := max(m.height-picChrome, 1)
+	for i := range rows {
+		if i < len(body) {
+			b.WriteString(" " + body[i])
+		}
+		b.WriteString("\n")
+	}
+	info := m.footer("h back", "? help")
+	if m.picImg != nil {
+		info += m.st.dim.Render(fmt.Sprintf("  %d×%d %s", m.picImg.Width, m.picImg.Height, m.picImg.Format))
+	}
+	b.WriteString("\n " + ansi.Truncate(info, w, "…"))
+	return b.String()
+}
+
 func (m Model) footer(items ...string) string {
 	parts := make([]string, len(items))
 	for i, it := range items {
@@ -841,7 +1018,7 @@ func (m Model) viewHelp() string {
 		{"↑ ↓  j k", "scroll"},
 		{"space  b", "page down, page up"},
 		{"g  G", "top, bottom"},
-		{"3 enter", "follow link [3]"},
+		{"3 enter", "follow link [3], or view it if it's an image"},
 		{"h  esc  q", "back"},
 		{"", ""},
 		{"ctrl+c", "quit from anywhere"},

@@ -16,6 +16,7 @@ import (
 	"github.com/burraksumer/sshr/internal/config"
 	"github.com/burraksumer/sshr/internal/content"
 	"github.com/burraksumer/sshr/internal/fetch"
+	"github.com/burraksumer/sshr/internal/images"
 	"github.com/burraksumer/sshr/internal/sanitize"
 	"github.com/burraksumer/sshr/internal/server"
 	"github.com/burraksumer/sshr/internal/ui"
@@ -94,7 +95,7 @@ func serve(ctx context.Context, args []string) error {
 	}
 	log := newLogger(cfg.LogFormat)
 
-	store, err := newStore(cfg, log)
+	store, loader, err := newStore(cfg, log)
 	if err != nil {
 		return err
 	}
@@ -107,6 +108,7 @@ func serve(ctx context.Context, args []string) error {
 		MaxTimeout:     cfg.MaxSession.D(),
 		ProxyProtocol:  cfg.ProxyProtocol,
 		TrustedProxies: cfg.TrustedProxies,
+		Images:         loader,
 	}, store, log)
 	if err != nil {
 		return err
@@ -122,14 +124,14 @@ func read(ctx context.Context, args []string) error {
 	}
 	cfg := config.Default()
 	cfg.URL = args[0]
-	store, err := newStore(cfg, slog.New(slog.DiscardHandler))
+	store, loader, err := newStore(cfg, slog.New(slog.DiscardHandler))
 	if err != nil {
 		return err
 	}
 	// The reader shows a loading screen and picks up posts as soon as the
 	// first ones are ready, so the refresh runs alongside it.
 	go store.Run(ctx, cfg.Refresh.D())
-	_, err = tea.NewProgram(ui.New(store), tea.WithContext(ctx)).Run()
+	_, err = tea.NewProgram(ui.New(store, loader), tea.WithContext(ctx)).Run()
 	if errors.Is(err, tea.ErrProgramKilled) || errors.Is(err, context.Canceled) {
 		return nil
 	}
@@ -142,7 +144,7 @@ func check(ctx context.Context, args []string) error {
 	}
 	cfg := config.Default()
 	cfg.URL = args[0]
-	store, err := newStore(cfg, newLogger("text"))
+	store, _, err := newStore(cfg, newLogger("text"))
 	if err != nil {
 		return err
 	}
@@ -201,14 +203,21 @@ func printManifest(site *content.Site) {
 	fmt.Println()
 }
 
-func newStore(cfg config.Config, log *slog.Logger) (*content.Store, error) {
+// newStore builds the site's store and, when images are on, an image loader
+// that shares its client, so images count against the same rate limit and
+// robots.txt rules as pages.
+func newStore(cfg config.Config, log *slog.Logger) (*content.Store, *images.Loader, error) {
 	base, err := cfg.SiteURL()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	client := fetch.New(fetch.Options{Hosts: cfg.Hosts(base)})
 	disc := &content.Discoverer{Client: client, Base: base, Manifest: &cfg.Site, MaxEntries: cfg.MaxEntries, PageBudget: cfg.PageBudget.D(), Log: log}
-	return content.NewStore(disc, log), nil
+	var loader *images.Loader
+	if cfg.Images {
+		loader = images.New(client)
+	}
+	return content.NewStore(disc, log), loader, nil
 }
 
 func newLogger(format string) *slog.Logger {

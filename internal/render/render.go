@@ -5,10 +5,13 @@ package render
 import (
 	"bytes"
 	"fmt"
+	"html"
+	"net/url"
 	"strings"
 
 	"charm.land/glamour/v2/ansi"
 	"charm.land/glamour/v2/styles"
+	"github.com/burraksumer/sshr/internal/sanitize"
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/ast"
 	"github.com/yuin/goldmark/extension"
@@ -22,6 +25,10 @@ import (
 type Link struct {
 	N   int
 	URL string
+	// Image is set for an image's source, and Alt is its alt text, decoded
+	// and sanitized.
+	Image bool
+	Alt   string
 }
 
 // Document is rendered markdown and the links it contains.
@@ -85,23 +92,34 @@ func Markdown(md string, opts Options) (Document, error) {
 }
 
 // numberLinks rewrites every inline link so it renders as its text followed by
-// " [n]", and returns the link list. Text for new nodes is appended to source,
-// so existing node segments stay valid.
+// " [n]", and every image as "[image: alt] [n]", and returns the link list.
+// Text for new nodes is appended to source, so existing node segments stay
+// valid.
 func numberLinks(doc ast.Node, source []byte, base string) ([]byte, []Link) {
 	var links []Link
 	byURL := map[string]int{}
-	// Links and bare URLs, in reading order, so numbers follow the text.
+	// Links, images and bare URLs, in reading order, so numbers follow the
+	// text. Inside a link only images count, since its text may hold a URL
+	// that GFM made into a link of its own.
 	var targets []ast.Node
+	inLink := 0
 	_ = ast.Walk(doc, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
-		if !entering {
-			return ast.WalkContinue, nil
-		}
 		switch n := n.(type) {
 		case *ast.Link:
-			targets = append(targets, n)
+			// Added on the way out, so an image inside comes first.
+			if entering {
+				inLink++
+			} else {
+				inLink--
+				targets = append(targets, n)
+			}
+		case *ast.Image:
+			if entering {
+				targets = append(targets, n)
+			}
 			return ast.WalkSkipChildren, nil
 		case *ast.AutoLink:
-			if n.AutoLinkType == ast.AutoLinkURL {
+			if entering && inLink == 0 && n.AutoLinkType == ast.AutoLinkURL {
 				targets = append(targets, n)
 			}
 		}
@@ -116,6 +134,9 @@ func numberLinks(doc ast.Node, source []byte, base string) ([]byte, []Link) {
 			}
 		case *ast.AutoLink:
 			dest = string(n.URL(source))
+		case *ast.Image:
+			source = numberImage(n, source, base, &links, byURL)
+			continue
 		}
 		dest = resolve(base, dest)
 		// A link to a section of this same document, which html-to-markdown
@@ -145,6 +166,44 @@ func numberLinks(doc ast.Node, source []byte, base string) ([]byte, []Link) {
 	return source, links
 }
 
+// numberImage replaces an image with "[image: alt]", followed by " [n]" when
+// its source is a web URL that can be shown.
+func numberImage(n *ast.Image, source []byte, base string, links *[]Link, byURL map[string]int) []byte {
+	raw := strings.TrimSpace(string(n.Text(source))) //nolint:staticcheck // the alt text is the children's text
+	alt := sanitize.Line(html.UnescapeString(raw))
+	label := "image"
+	if alt != "" {
+		label = "image: " + raw
+	}
+	em := ast.NewEmphasis(1)
+	var t *ast.Text
+	source, t = appendText(source, "["+label+"]")
+	em.AppendChild(em, t)
+	parent := n.Parent()
+	parent.ReplaceChild(parent, n, em)
+
+	dest := linkDestination(n.Destination)
+	if dest == "" {
+		return source
+	}
+	dest = resolve(base, dest)
+	if u, err := url.Parse(dest); err != nil || (u.Scheme != "http" && u.Scheme != "https") || len(dest) > maxImageURL {
+		return source
+	}
+	num, ok := byURL[dest]
+	if !ok {
+		num = len(*links) + 1
+		byURL[dest] = num
+		*links = append(*links, Link{N: num, URL: dest, Image: true, Alt: alt})
+	}
+	source, t = appendText(source, fmt.Sprintf(" [%d]", num))
+	parent.InsertAfter(parent, em, t)
+	return source
+}
+
+// maxImageURL leaves out data: URLs and other huge sources.
+const maxImageURL = 2048
+
 // appendLinkList adds a "Links" section listing every numbered link.
 func appendLinkList(doc ast.Node, source *[]byte, links []Link) {
 	var t *ast.Text
@@ -159,7 +218,11 @@ func appendLinkList(doc ast.Node, source *[]byte, links []Link) {
 	for _, l := range links {
 		item := ast.NewListItem(2)
 		block := ast.NewTextBlock()
-		*source, t = appendText(*source, fmt.Sprintf("[%d] ", l.N))
+		prefix := fmt.Sprintf("[%d] ", l.N)
+		if l.Image {
+			prefix += "image "
+		}
+		*source, t = appendText(*source, prefix)
 		block.AppendChild(block, t)
 		start := len(*source)
 		*source = append(*source, l.URL...)

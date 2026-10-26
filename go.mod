@@ -12,6 +12,7 @@ require (
 	codeberg.org/readeck/go-readability/v2 v2.1.3
 	github.com/BurntSushi/toml v1.6.0
 	github.com/JohannesKaufmann/html-to-markdown/v2 v2.5.2
+	github.com/charmbracelet/ultraviolet v0.0.0-20261008173134-6b8d4baf91b4
 	github.com/charmbracelet/x/ansi v0.11.9
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/mmcdole/gofeed v1.5.0
@@ -19,6 +20,7 @@ require (
 	github.com/temoto/robotstxt v1.1.2
 	github.com/yuin/goldmark v1.8.6
 	golang.org/x/crypto v0.58.0
+	golang.org/x/image v0.47.0
 	golang.org/x/net v0.61.0
 	golang.org/x/time v0.16.0
 )
@@ -33,7 +35,6 @@ require (
 	github.com/aymerick/douceur v0.2.0 // indirect
 	github.com/charmbracelet/colorprofile v0.4.3 // indirect
 	github.com/charmbracelet/keygen v0.5.4 // indirect
-	github.com/charmbracelet/ultraviolet v0.0.0-20261008173134-6b8d4baf91b4 // indirect
 	github.com/charmbracelet/x/conpty v0.2.0 // indirect
 	github.com/charmbracelet/x/exp/slice v0.0.0-20250327172914-2fdc97757edf // indirect
 	github.com/charmbracelet/x/term v0.2.2 // indirect
