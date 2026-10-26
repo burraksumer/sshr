@@ -128,3 +128,34 @@ func TestValidateRejectsUnconvertibleHost(t *testing.T) {
 		t.Error("host that IDNA rejects passed validation")
 	}
 }
+
+// The example file, with its [site] section uncommented, loads.
+func TestExampleSiteSection(t *testing.T) {
+	raw, err := os.ReadFile("../../sshr.example.toml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(raw)
+	s = s[strings.Index(s, "# [site]"):]
+	var b strings.Builder
+	b.WriteString("url = \"example.com\"\n")
+	for _, l := range strings.Split(s, "\n") {
+		b.WriteString(strings.TrimPrefix(strings.TrimPrefix(l, "#"), " ") + "\n")
+	}
+	path := filepath.Join(t.TempDir(), "sshr.toml")
+	os.WriteFile(path, []byte(b.String()), 0o600)
+	c, err := Load(path, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Site.Accent != "#e8590c" || len(c.Site.Nav) != 3 || c.Site.Nav[2].URL != "https://github.com/example" || c.Site.Sitemap == nil || *c.Site.Sitemap {
+		t.Errorf("site = %+v", c.Site)
+	}
+	if !strings.Contains(c.Site.Logo, `|  _| \ \/ /`) {
+		t.Errorf("logo = %q", c.Site.Logo)
+	}
+	os.WriteFile(path, []byte("url = \"example.com\"\n[site]\ntitel = \"x\"\n"), 0o600)
+	if _, err := Load(path, true); err == nil || !strings.Contains(err.Error(), "titel") {
+		t.Errorf("unknown [site] key: %v", err)
+	}
+}
